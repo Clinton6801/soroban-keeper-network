@@ -1,5 +1,16 @@
 import http from "node:http";
 
+/**
+ * Standard skip reasons tracked in metrics:
+ * - unprofitable: Task reward minus estimated fees is below minimum margin
+ * - noExecutor: No executor registered for this task type
+ * - pastDeadline: Task deadline has passed (expired)
+ * - condition_not_met: Condition-aware is_claimable returned false (issue #0402)
+ * - oracle_prediction_unmet: Oracle feed prediction indicated condition is false (issue #0426)
+ * - condition_mismatch_predicted_*_actual_*: Oracle prediction disagreed with on-chain result
+ * - other: Any other skip reason not in the above categories
+ */
+
 export interface TaskTypeMetrics {
   taskType: string;
   claimedTotal: number;
@@ -94,6 +105,19 @@ export class MetricsCollector {
     const tt = this.ensureTaskType(taskType);
     tt.skippedTotal += 1;
     tt.skippedByReason[reason] = (tt.skippedByReason[reason] || 0) + 1;
+  }
+
+  /**
+   * Record an oracle condition prediction mismatch between predicted and actual outcomes.
+   * Used for monitoring oracle feed reliability (issue #0426).
+   */
+  public recordConditionMismatch(
+    taskType: string,
+    predicted: boolean,
+    actual: boolean
+  ): void {
+    const reason = `condition_mismatch_predicted_${predicted}_actual_${actual}`;
+    this.recordSkip(taskType, reason);
   }
 
   public recordRpcError(errorType: string): void {
