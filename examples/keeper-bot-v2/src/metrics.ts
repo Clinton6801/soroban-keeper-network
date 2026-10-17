@@ -1,16 +1,5 @@
 import http from "node:http";
 
-/**
- * Standard skip reasons tracked in metrics:
- * - unprofitable: Task reward minus estimated fees is below minimum margin
- * - noExecutor: No executor registered for this task type
- * - pastDeadline: Task deadline has passed (expired)
- * - condition_not_met: Condition-aware is_claimable returned false (issue #0402)
- * - oracle_prediction_unmet: Oracle feed prediction indicated condition is false (issue #0426)
- * - condition_mismatch_predicted_*_actual_*: Oracle prediction disagreed with on-chain result
- * - other: Any other skip reason not in the above categories
- */
-
 export interface TaskTypeMetrics {
   taskType: string;
   claimedTotal: number;
@@ -108,16 +97,31 @@ export class MetricsCollector {
   }
 
   /**
-   * Record an oracle condition prediction mismatch between predicted and actual outcomes.
-   * Used for monitoring oracle feed reliability (issue #0426).
+   * Record a task skipped due to unmet oracle condition (issue #665)
    */
-  public recordConditionMismatch(
-    taskType: string,
-    predicted: boolean,
-    actual: boolean
-  ): void {
-    const reason = `condition_mismatch_predicted_${predicted}_actual_${actual}`;
-    this.recordSkip(taskType, reason);
+  public recordSkipConditionNotMet(taskType: string): void {
+    this.recordSkip(taskType, "condition_not_met");
+  }
+
+  /**
+   * Record a task skipped due to being unprofitable
+   */
+  public recordSkipUnprofitable(taskType: string): void {
+    this.recordSkip(taskType, "unprofitable");
+  }
+
+  /**
+   * Record a task skipped due to no available executor
+   */
+  public recordSkipNoExecutor(taskType: string): void {
+    this.recordSkip(taskType, "no_executor");
+  }
+
+  /**
+   * Record a task skipped due to past deadline
+   */
+  public recordSkipPastDeadline(taskType: string): void {
+    this.recordSkip(taskType, "past_deadline");
   }
 
   public recordRpcError(errorType: string): void {

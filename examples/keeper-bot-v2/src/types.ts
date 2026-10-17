@@ -35,19 +35,6 @@ export interface EvaluatedCandidate {
   reward: bigint;
   deadline: number;
   verifier: string | null;
-  
-  // Condition evaluation results (issue #0402, #0426)
-  condition?: {
-    // Prediction result from oracle pre-check, if available
-    prediction?: {
-      claimable: boolean;
-      method: "oracle_feed" | "simulated" | "unknown";
-      timestamp: number;
-      details?: Record<string, unknown>;
-    };
-    // Whether on-chain evaluation was skipped due to prediction
-    skipped_simulation?: boolean;
-  };
 }
 
 /**
@@ -108,8 +95,7 @@ export interface RoundSummary {
     unprofitable: bigint[];
     noExecutor: bigint[];
     pastDeadline: bigint[];
-    condition_not_met: bigint[];
-    oracle_prediction_unmet: bigint[];
+    conditionNotMet: bigint[]; // Tasks skipped due to unmet oracle conditions
     other: bigint[];
   };
   errors: Array<{
@@ -127,29 +113,4 @@ export interface ExecutorContext {
   log: (message: string) => void;
   keypairPublicKey: string;
   networkPassphrase: string;
-}
-
-/**
- * Options for condition evaluation during candidate processing
- */
-export interface ConditionEvaluationOptions {
-  /**
-   * Whether to use oracle feed predictions instead of simulating conditions.
-   * Saves RPC calls when multiple tasks share the same oracle feed.
-   * @default true
-   */
-  useOraclePrediction?: boolean;
-
-  /**
-   * Whether to log prediction/reality mismatches for monitoring.
-   * Useful for detecting oracle feed reliability issues.
-   * @default true
-   */
-  logMismatches?: boolean;
-
-  /**
-   * Whether to fall back to on-chain simulation if oracle feed read fails.
-   * @default true
-   */
-  fallbackToSimulation?: boolean;
 }
