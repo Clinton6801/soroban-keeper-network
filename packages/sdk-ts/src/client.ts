@@ -12,7 +12,9 @@ import {
   Account,
   BASE_FEE,
   Contract,
+  Operation,
   StrKey,
+  type Transaction,
   TransactionBuilder,
   rpc,
   scValToNative,
@@ -20,13 +22,56 @@ import {
 } from "@stellar/stellar-sdk";
 
 import type { ContractCaller, TransactionSigner } from "./core/caller.js";
-import { KeeperRpcError, KeeperSdkError, toKeeperError } from "./errors.js";
+import { decodeKeeperErrorCode, KeeperRpcError, KeeperSdkError, toKeeperError } from "./errors.js";
+import { withRetry } from "./retry.js";
+import type { IntegerInput } from "./core/scval.js";
+import type { Task } from "./types.js";
 import type { ContractCompatibility, VersionOptions } from "./methods/views.js";
 import * as views from "./methods/views.js";
-import type { WithdrawRewardsParams } from "./methods/withdrawRewards.js";
+import type { WithdrawRewardsOutcome, WithdrawRewardsParams } from "./methods/withdrawRewards.js";
 import { tryWithdrawRewards, withdrawRewards } from "./methods/withdrawRewards.js";
-import type { ExecuteTaskParams } from "./methods/executeTask.js";
+import type { ExecuteTaskOutcome, ExecuteTaskParams } from "./methods/executeTask.js";
+import type { AuthEntrySigner } from "./core/auth.js";
+import { signAuthEntries } from "./core/auth.js";
 import { executeTask } from "./methods/executeTask.js";
+import type { RegisterTaskParams } from "./methods/registerTask.js";
+import { registerTask } from "./methods/registerTask.js";
+import type { IncreaseRewardParams } from "./methods/increaseReward.js";
+import { increaseReward } from "./methods/increaseReward.js";
+import type { ExtendDeadlineParams } from "./methods/extendDeadline.js";
+import { extendDeadline } from "./methods/extendDeadline.js";
+import type { ClaimTaskOutcome, ClaimTaskParams } from "./methods/claimTask.js";
+import { claimTask } from "./methods/claimTask.js";
+import type { CancelTaskOutcome, CancelTaskParams } from "./methods/cancelTask.js";
+import { cancelTask } from "./methods/cancelTask.js";
+import type { ExpireTaskParams } from "./methods/expireTask.js";
+import { expireTask } from "./methods/expireTask.js";
+import type {
+  SweepFeesParams,
+  TransferAdminParams,
+  UpgradeParams,
+} from "./methods/adminDualAuth.js";
+import { sweepFees, transferAdmin, upgrade } from "./methods/adminDualAuth.js";
+import type {
+  AdminCallParams,
+  SetFeeBpsParams,
+  SetMinRewardParams,
+} from "./methods/admin.js";
+import { pause, setFeeBps, setMinReward, unpause } from "./methods/admin.js";
+import type {
+  DisputeExecutionParams,
+  InitiateUnbondParams,
+  RaiseSlashAppealParams,
+  ResolveExecutionDisputeParams,
+  ResolveSlashAppealParams,
+  SetDisputeWindowParams,
+  SetMinStakeParams,
+  SlashParams,
+  StakeDepositParams,
+  WithdrawStakeParams,
+} from "./methods/staking.js";
+import * as staking from "./methods/staking.js";
+import type { PendingCredit, SlashRecord, UnbondRequest } from "./types.js";
 
 /**
  * The subset of `rpc.Server` this SDK uses.
@@ -37,7 +82,12 @@ import { executeTask } from "./methods/executeTask.js";
  */
 export type RpcServerLike = Pick<
   rpc.Server,
-  "getAccount" | "simulateTransaction" | "sendTransaction" | "getTransaction"
+  | "getAccount"
+  | "simulateTransaction"
+  | "sendTransaction"
+  | "getTransaction"
+  | "getLatestLedger"
+  | "getEvents"
 >;
 
 /** Minimal `Keypair` surface, so callers need not import the class type. */
@@ -79,6 +129,15 @@ export interface KeeperRegistryClientOptions {
   /** Delay between confirmation polls. */
   pollIntervalMs?: number | undefined;
   /**
+   * Retries (in addition to the first attempt) for a transient RPC failure
+   * while sending or polling a transaction. A decodable contract error (see
+   * {@link decodeKeeperErrorCode}) is never retried, since it is a
+   * deterministic verdict, not a transport failure. Defaults to 3.
+   */
+  maxRetries?: number | undefined;
+  /** Base delay in milliseconds for the retry back-off. Defaults to 500. */
+  retryBaseMs?: number | undefined;
+  /**
    * Pre-built RPC server. Supplying one skips constructing a `rpc.Server` from
    * `rpcUrl` -- the seam this package's tests use to run without a network.
    */
@@ -96,6 +155,13 @@ export interface KeeperRegistryClientOptions {
  * machine holding no funded key at all -- which is exactly the case
  * `admin()`-on-an-uninitialized-registry has to serve.
  */
+/**
+ * How long a signed auth entry stays valid, in ledgers (~5s each, so ~1 hour).
+ * Long enough to survive submission and retry, short enough that a signature
+ * captured off the wire is not reusable indefinitely.
+ */
+const AUTH_ENTRY_VALIDITY_LEDGERS = 720;
+
 const READ_SOURCE_ACCOUNT = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 export class KeeperRegistryClient implements ContractCaller {
@@ -109,6 +175,8 @@ export class KeeperRegistryClient implements ContractCaller {
   private readonly timeoutSeconds: number;
   private readonly confirmationTimeoutMs: number;
   private readonly pollIntervalMs: number;
+  private readonly maxRetries: number;
+  private readonly retryBaseMs: number;
   private readonly warnSink: (message: string) => void;
 
   constructor(options: KeeperRegistryClientOptions) {
@@ -136,6 +204,8 @@ export class KeeperRegistryClient implements ContractCaller {
     this.timeoutSeconds = options.timeoutSeconds ?? 30;
     this.confirmationTimeoutMs = options.confirmationTimeoutMs ?? 30_000;
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
+    this.maxRetries = options.maxRetries ?? 3;
+    this.retryBaseMs = options.retryBaseMs ?? 500;
     this.warnSink = options.warn ?? ((message: string) => console.warn(message));
   }
 
@@ -179,17 +249,196 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link views.checkContractCompatibility}. */
   checkContractCompatibility(): Promise<ContractCompatibility> {
     return views.checkContractCompatibility(this);
+  }
+
+  /** See {@link views.getTask}. */
+  getTask(taskId: IntegerInput): Promise<Task> {
+    return views.getTask(this, taskId);
+  }
+
+  /** See {@link views.taskCount}. */
+  taskCount(): Promise<number> {
+    return views.taskCount(this);
+  }
+
+  /** See {@link views.keeperBalance}. */
+  keeperBalance(keeper: string): Promise<bigint> {
+    return views.keeperBalance(this, keeper);
+  }
+
+  /** See {@link views.keeperReputation}. */
+  keeperReputation(keeper: string): Promise<number> {
+    return views.keeperReputation(this, keeper);
+  }
+
+  /** See {@link views.isClaimable}. */
+  isClaimable(taskId: IntegerInput): Promise<boolean> {
+    return views.isClaimable(this, taskId);
+  }
+
+  /** See {@link transferAdmin}. */
+  transferAdmin(params: TransferAdminParams): Promise<void> {
+    return transferAdmin(this, params);
+  }
+
+  /** See {@link upgrade}. */
+  upgrade(params: UpgradeParams): Promise<void> {
+    return upgrade(this, params);
+  }
+
+  /** See {@link sweepFees}. */
+  sweepFees(params: SweepFeesParams): Promise<void> {
+    return sweepFees(this, params);
+  }
+
+  /** See {@link pause}. */
+  pause(params: AdminCallParams): Promise<void> {
+    return pause(this, params);
+  }
+
+  /** See {@link unpause}. */
+  unpause(params: AdminCallParams): Promise<void> {
+    return unpause(this, params);
+  }
+
+  /** See {@link setFeeBps}. */
+  setFeeBps(params: SetFeeBpsParams): Promise<void> {
+    return setFeeBps(this, params);
+  }
+
+  /** See {@link setMinReward}. */
+  setMinReward(params: SetMinRewardParams): Promise<void> {
+    return setMinReward(this, params);
+  }
+
   /** See {@link withdrawRewards}. */
-  withdrawRewards(params: WithdrawRewardsParams): Promise<bigint> {
+  withdrawRewards(params: WithdrawRewardsParams): Promise<WithdrawRewardsOutcome> {
     return withdrawRewards(this, params);
   }
 
   /** See {@link tryWithdrawRewards}: resolves to `0n` instead of rejecting. */
   tryWithdrawRewards(params: WithdrawRewardsParams): Promise<bigint> {
     return tryWithdrawRewards(this, params);
+  }
+
   /** See {@link executeTask}. */
-  executeTask(params: ExecuteTaskParams): Promise<void> {
+  executeTask(params: ExecuteTaskParams): Promise<ExecuteTaskOutcome> {
     return executeTask(this, params);
+  }
+
+  /** See {@link registerTask}. */
+  registerTask(params: RegisterTaskParams): Promise<bigint> {
+    return registerTask(this, params);
+  }
+
+  /** See {@link increaseReward}. */
+  increaseReward(params: IncreaseRewardParams): Promise<void> {
+    return increaseReward(this, params);
+  }
+
+  /** See {@link extendDeadline}. */
+  extendDeadline(params: ExtendDeadlineParams): Promise<void> {
+    return extendDeadline(this, params);
+  }
+
+  /** See {@link claimTask}: routine claim-race outcomes are returned, not thrown. */
+  claimTask(params: ClaimTaskParams): Promise<ClaimTaskOutcome> {
+    return claimTask(this, params);
+  }
+
+  /** See {@link cancelTask}: a live lock and a terminal status are returned, not thrown. */
+  cancelTask(params: CancelTaskParams): Promise<CancelTaskOutcome> {
+    return cancelTask(this, params);
+  }
+
+  /** See {@link expireTask}. */
+  expireTask(params: ExpireTaskParams): Promise<void> {
+    return expireTask(this, params);
+  }
+
+  /** See {@link staking.stakeDeposit}. */
+  stakeDeposit(params: StakeDepositParams): Promise<void> {
+    return staking.stakeDeposit(this, params);
+  }
+
+  /** See {@link staking.initiateUnbond}. */
+  initiateUnbond(params: InitiateUnbondParams): Promise<void> {
+    return staking.initiateUnbond(this, params);
+  }
+
+  /** See {@link staking.withdrawStake}. */
+  withdrawStake(params: WithdrawStakeParams): Promise<bigint> {
+    return staking.withdrawStake(this, params);
+  }
+
+  /** See {@link staking.slash}. */
+  slash(params: SlashParams): Promise<bigint> {
+    return staking.slash(this, params);
+  }
+
+  /** See {@link staking.setMinStake}. */
+  setMinStake(params: SetMinStakeParams): Promise<void> {
+    return staking.setMinStake(this, params);
+  }
+
+  /** See {@link staking.raiseSlashAppeal}. */
+  raiseSlashAppeal(params: RaiseSlashAppealParams): Promise<void> {
+    return staking.raiseSlashAppeal(this, params);
+  }
+
+  /** See {@link staking.resolveSlashAppeal}. */
+  resolveSlashAppeal(params: ResolveSlashAppealParams): Promise<void> {
+    return staking.resolveSlashAppeal(this, params);
+  }
+
+  /** See {@link staking.setDisputeWindow}. */
+  setDisputeWindow(params: SetDisputeWindowParams): Promise<void> {
+    return staking.setDisputeWindow(this, params);
+  }
+
+  /** See {@link staking.disputeExecution}. */
+  disputeExecution(params: DisputeExecutionParams): Promise<void> {
+    return staking.disputeExecution(this, params);
+  }
+
+  /** See {@link staking.resolveExecutionDispute}. */
+  resolveExecutionDispute(params: ResolveExecutionDisputeParams): Promise<void> {
+    return staking.resolveExecutionDispute(this, params);
+  }
+
+  /** See {@link staking.keeperStake}. */
+  keeperStake(keeper: string): Promise<bigint> {
+    return staking.keeperStake(this, keeper);
+  }
+
+  /** See {@link staking.pendingUnbond}. */
+  pendingUnbond(keeper: string): Promise<UnbondRequest | undefined> {
+    return staking.pendingUnbond(this, keeper);
+  }
+
+  /** See {@link staking.minStake}. */
+  minStake(): Promise<bigint> {
+    return staking.minStake(this);
+  }
+
+  /** See {@link staking.getSlash}. */
+  getSlash(slashId: IntegerInput): Promise<SlashRecord | undefined> {
+    return staking.getSlash(this, slashId);
+  }
+
+  /** See {@link staking.slashHistory}. */
+  slashHistory(keeper: string): Promise<{ count: number; totalSlashed: bigint }> {
+    return staking.slashHistory(this, keeper);
+  }
+
+  /** See {@link staking.disputeWindow}. */
+  disputeWindow(): Promise<number> {
+    return staking.disputeWindow(this);
+  }
+
+  /** See {@link staking.pendingReward}. */
+  pendingReward(keeper: string): Promise<PendingCredit[]> {
+    return staking.pendingReward(this, keeper);
   }
 
   // -- shared plumbing -------------------------------------------------------
@@ -258,12 +507,93 @@ export class KeeperRegistryClient implements ContractCaller {
     });
     const signed = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
 
-    let sent: rpc.Api.SendTransactionResponse;
+    const sent = await this.sendTransactionWithRetry(signed, context);
+    if (sent.status !== "PENDING") {
+      throw toKeeperError(sent.errorResult ?? `submission returned ${sent.status}`, context);
+    }
+
+    return this.confirm<T>(sent.hash, context);
+  }
+
+  /**
+   * Like {@link invoke}, but additionally signs the Soroban auth entries that
+   * require an address other than the source account.
+   *
+   * Only `transfer_admin` needs this today. The flow differs from `invoke` in
+   * one place: after simulation reports which addresses must authorize, each
+   * matching entry is signed and the transaction is *rebuilt* carrying those
+   * signed entries, because auth entries are part of the operation and cannot
+   * be attached to an already-built transaction.
+   *
+   * @internal Plumbing for the wrappers above; not a supported entry point.
+   */
+  async invokeMultiAuth<T>(params: {
+    method: string;
+    args?: xdr.ScVal[];
+    source: string;
+    signer?: TransactionSigner;
+    /** Signers for every address the call requires, including the source. */
+    authSigners: readonly AuthEntrySigner[];
+  }): Promise<T> {
+    const { method, args = [], source, authSigners } = params;
+    const context = `${method} failed`;
+    const signer = this.resolveSigner(method, source, params.signer);
+
+    const account = await this.loadAccount(source, context);
+    // `build()` advances the local sequence counter, so the rebuild below needs
+    // the value from before the first build, not the mutated one.
+    const startingSequence = account.sequenceNumber();
+    const built = this.buildTransaction(account, method, args);
+
+    let simulation: rpc.Api.SimulateTransactionResponse;
     try {
-      sent = await this.server.sendTransaction(signed as never);
+      simulation = await this.server.simulateTransaction(built);
     } catch (cause) {
       throw toKeeperError(cause, context);
     }
+    if (rpc.Api.isSimulationError(simulation)) {
+      throw toKeeperError(simulation.error, context);
+    }
+
+    const success = simulation as rpc.Api.SimulateTransactionSuccessResponse;
+    const entries = success.result?.auth ?? [];
+
+    let validUntilLedgerSeq: number;
+    try {
+      validUntilLedgerSeq =
+        (await this.server.getLatestLedger()).sequence + AUTH_ENTRY_VALIDITY_LEDGERS;
+    } catch (cause) {
+      throw toKeeperError(cause, context);
+    }
+
+    const signedAuth = await signAuthEntries(
+      entries,
+      authSigners,
+      validUntilLedgerSeq,
+      this.networkPassphrase,
+      method,
+    );
+
+    const rebuilt = new TransactionBuilder(new Account(source, startingSequence), {
+      fee: this.fee,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        Operation.invokeHostFunction({
+          func: (built.operations[0] as Operation.InvokeHostFunction).func,
+          auth: signedAuth,
+        }),
+      )
+      .setTimeout(this.timeoutSeconds)
+      .build();
+
+    const prepared = rpc.assembleTransaction(rebuilt, simulation).build();
+    const signedXdr = await signer.signTransaction(prepared.toXDR(), {
+      networkPassphrase: this.networkPassphrase,
+    });
+    const signed = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+
+    const sent = await this.sendTransactionWithRetry(signed, context);
     if (sent.status !== "PENDING") {
       throw toKeeperError(sent.errorResult ?? `submission returned ${sent.status}`, context);
     }
@@ -321,13 +651,39 @@ export class KeeperRegistryClient implements ContractCaller {
       .build();
   }
 
+  /**
+   * Submits a signed transaction, retrying a transient RPC failure
+   * (`this.maxRetries` times, exponential back-off) via {@link withRetry}
+   * rather than surfacing it on the first blip. A decodable contract error
+   * is a deterministic verdict, not a transport failure, so it is never
+   * retried (backlog issue 0188).
+   */
+  private async sendTransactionWithRetry(
+    signed: Parameters<RpcServerLike["sendTransaction"]>[0],
+    context: string,
+  ): Promise<rpc.Api.SendTransactionResponse> {
+    try {
+      return await withRetry(() => this.server.sendTransaction(signed), {
+        maxRetries: this.maxRetries,
+        retryBaseMs: this.retryBaseMs,
+        isPermanentError: isDecodableContractError,
+      });
+    } catch (cause) {
+      throw toKeeperError(cause, context);
+    }
+  }
+
   /** Polls until the submitted transaction leaves `NOT_FOUND`/`PENDING`. */
   private async confirm<T>(hash: string, context: string): Promise<T> {
     const deadline = Date.now() + this.confirmationTimeoutMs;
     for (;;) {
       let result: rpc.Api.GetTransactionResponse;
       try {
-        result = await this.server.getTransaction(hash);
+        result = await withRetry(() => this.server.getTransaction(hash), {
+          maxRetries: this.maxRetries,
+          retryBaseMs: this.retryBaseMs,
+          isPermanentError: isDecodableContractError,
+        });
       } catch (cause) {
         throw toKeeperError(cause, context);
       }
@@ -347,249 +703,47 @@ export class KeeperRegistryClient implements ContractCaller {
         );
       }
       await sleep(this.pollIntervalMs);
-// The core of the SDK: a typed client wrapping the repetitive
-// simulate-build-sign-submit dance the keeper-bot example currently
-// hand-rolls. See backlog 0153.
-
-import { StrKey } from "@stellar/stellar-sdk";
-
-import { ContractInvoker } from "./core/contractInvoker";
-import { decodeKeeperError, KeeperContractError, TaskNotFoundError } from "./errors";
-import { getTask } from "./methods/views";
-import { buildFeeBumpTransaction, buildTransaction, submitSignedTransaction } from "./transactionBuilder";
-import type { KeeperRegistryClientConfig, Task } from "./types";
-
-/**
- * Typed client for the keeper-registry contract. Constructor validates its
- * inputs so a malformed contract address or network passphrase fails fast
- * with a clear error, rather than surfacing as an opaque RPC failure later.
- *
- * ```ts
- * const client = new KeeperRegistryClient({ contractId, rpcUrl, networkPassphrase });
- * const task = await client.getTask(taskId);
- * ```
- */
-export class KeeperRegistryClient {
-  readonly config: KeeperRegistryClientConfig;
-  /** @internal exposed for `methods/*` and `transactionBuilder.ts`, not part of the public API. */
-  readonly invoker: ContractInvoker;
-
-  constructor(config: KeeperRegistryClientConfig) {
-    if (!StrKey.isValidContract(config.contractId)) {
-      throw new Error(`KeeperRegistryClient: "${config.contractId}" is not a valid Soroban contract address (expected a "C..." StrKey).`);
-    }
-    if (!config.rpcUrl || !/^https?:\/\//.test(config.rpcUrl)) {
-      throw new Error(`KeeperRegistryClient: "${config.rpcUrl}" is not a valid RPC URL.`);
-    }
-    if (!config.networkPassphrase) {
-      throw new Error("KeeperRegistryClient: networkPassphrase is required.");
-    }
-
-    this.config = config;
-    this.invoker = new ContractInvoker(config);
-  }
-
-  /**
-   * `getTask` on a nonexistent id rejects with {@link TaskNotFoundError}
-   * rather than returning a nullish value, so a caller cannot mistake
-   * "task does not exist" for "task exists and every field happens to be
-   * falsy."
-   */
-  async getTask(taskId: number, sourcePublicKey?: string): Promise<Task> {
-    try {
-      return await getTask(this.invoker, taskId, this.config.readOnlySourceAccount, sourcePublicKey);
-    } catch (err) {
-      const code = decodeKeeperError(err instanceof Error ? err.message : undefined);
-      if (code !== undefined) {
-        if (code === 4 /* TaskNotFound, see errors.ts KeeperErrorCode */) {
-          throw new TaskNotFoundError(taskId);
-        }
-        throw new KeeperContractError(code);
-      }
-      throw err;
     }
   }
 
-  buildTransaction = buildTransaction.bind(null, this);
-  buildFeeBumpTransaction = buildFeeBumpTransaction.bind(null, this);
-  submitSignedTransaction = submitSignedTransaction.bind(null, this);
-import {
-  BASE_FEE,
-  Contract,
-  Keypair,
-  TransactionBuilder,
-  scValToNative,
-  type xdr,
-} from "@stellar/stellar-sdk";
-// The Soroban RPC client moved to this subpath in @stellar/stellar-sdk — it
-// is NOT a `SorobanRpc` named export off the package root in the version
-// this SDK targets (^16.2.0), even though examples/keeper-bot/index.js
-// (pre-migration) imports it that way. That import resolves to `undefined`
-// at runtime in this version — a real, pre-existing bug in the bot's own
-// code, independent of this SDK (see this PR's description). This client
-// uses the correct, current import path.
-import * as Soroban from "@stellar/stellar-sdk/rpc";
-import { NETWORK_PRESETS, type NetworkName, type NetworkPreset } from "./network.js";
-
-export interface KeeperRegistryClientOptions {
-  readonly contractId: string;
-  /** Either a preset name ("testnet" | "futurenet" | "mainnet") or a fully custom preset (for a local sandbox, say). */
-  readonly network: NetworkName | NetworkPreset;
-  readonly keypair: Keypair;
-  /** Passed through to `Soroban.Server`. Defaults to `false`, matching the keeper-bot's existing behavior. */
-  readonly allowHttp?: boolean;
-}
-
-/**
- * A thin wrapper over `@stellar/stellar-sdk`'s Soroban RPC client, exposing
- * exactly the two operations `examples/keeper-bot/index.js` hand-rolled as
- * `invokeContract`/`readContract` (issue 0163/0166 in the SDK epic) — this
- * class's `invoke`/`read` methods have IDENTICAL semantics and IDENTICAL
- * error messages to that bot's original functions, so migrating the bot onto
- * this client is a like-for-like swap, not a behavior change.
- *
- * Deliberately NOT a full contract-method-per-function client (e.g. no
- * generated `claimTask()`/`executeTask()` methods) — that would require
- * either code generation from the contract's WASM or hand-writing one method
- * per contract function, both larger undertakings than this scaffold's
- * scope. `invoke`/`read` are the generic building blocks every specific
- * contract call is built from; a fuller, generated client is a natural next
- * step once this shape is validated by real usage (the keeper-bot
- * migration).
- */
-export class KeeperRegistryClient {
-  readonly contractId: string;
-  readonly networkPassphrase: string;
-  readonly rpcUrl: string;
-  private readonly server: Soroban.Server;
-  /** The keypair this client signs `invoke()` transactions with. Public so callers can build ScVal args (e.g. `Address.fromString(client.keypair.publicKey())`) without threading a second copy of it through their own code. */
-  readonly keypair: Keypair;
-  private readonly contract: Contract;
-
-  constructor(options: KeeperRegistryClientOptions) {
-    this.contractId = options.contractId;
-    const preset =
-      typeof options.network === "string"
-        ? NETWORK_PRESETS[options.network]
-        : options.network;
-    this.networkPassphrase = preset.networkPassphrase;
-    this.rpcUrl = preset.rpcUrl;
-    this.keypair = options.keypair;
-    this.server = new Soroban.Server(this.rpcUrl, {
-      allowHttp: options.allowHttp ?? false,
-    });
-    this.contract = new Contract(this.contractId);
-  }
-
-  /** The underlying `Soroban.Server` — escape hatch for anything this wrapper doesn't (yet) cover. */
-  get rpc(): Soroban.Server {
-    return this.server;
-  }
-
-  /**
-   * Simulates, signs, submits, and polls for confirmation of a contract
-   * call that mutates state.
-   *
-   * Ported behavior-for-behavior from the keeper-bot's `invokeContract` +
-   * `simulateAndSend`: same simulate → assemble → sign → send → poll
-   * sequence, same 30-attempt / 2-second poll loop, same error message
-   * shapes ("Simulation failed: ...", "Send failed: ...", "Transaction
-   * failed with status: ...").
-   */
-  async invoke(
+  /** @internal Simulates and assembles `method(args)` from `source`, without signing or submitting — the seam {@link "./transactionBuilder.js"} builds unsigned transactions on. */
+  async buildAssembledTransaction(
+    source: string,
     method: string,
-    args: readonly xdr.ScVal[],
-  ): Promise<Soroban.Api.GetSuccessfulTransactionResponse> {
-    const account = await this.server.getAccount(this.keypair.publicKey());
+    args: xdr.ScVal[],
+  ): Promise<Transaction> {
+    const context = `${method} simulation failed`;
+    const account = await this.loadAccount(source, context);
+    const built = this.buildTransaction(account, method, args);
 
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(this.contract.call(method, ...args))
-      .setTimeout(30)
-      .build();
-
-    const simResponse = await this.server.simulateTransaction(tx);
-    if (Soroban.Api.isSimulationError(simResponse)) {
-      throw new Error(`Simulation failed: ${simResponse.error}`);
-    }
-
-    const preparedTx = Soroban.assembleTransaction(tx, simResponse).build();
-    preparedTx.sign(this.keypair);
-
-    const sendResponse = await this.server.sendTransaction(preparedTx);
-    if (sendResponse.status === "ERROR") {
-      throw new Error(
-        `Send failed: ${JSON.stringify(sendResponse.errorResult)}`,
-      );
-    }
-
-    let getResponse = await this.server.getTransaction(sendResponse.hash);
-    let attempts = 0;
-    while (
-      getResponse.status === Soroban.Api.GetTransactionStatus.NOT_FOUND &&
-      attempts < 30
-    ) {
-      await sleep(2000);
-      getResponse = await this.server.getTransaction(sendResponse.hash);
-      attempts++;
-    }
-
-    if (getResponse.status === Soroban.Api.GetTransactionStatus.SUCCESS) {
-      return getResponse;
-    }
-    throw new Error(`Transaction failed with status: ${getResponse.status}`);
-  }
-
-  /**
-   * Evaluates a read-only contract function via simulation. No transaction
-   * is signed, submitted, or confirmed, and no sequence number is consumed.
-   *
-   * Ported behavior-for-behavior from the keeper-bot's `readContract`,
-   * including its documented caveat: simulation still builds a transaction
-   * envelope, so the calling account must already exist (be funded) on-chain.
-   */
-  async read(method: string, args: readonly xdr.ScVal[]): Promise<unknown> {
-    const account = await this.server.getAccount(this.keypair.publicKey());
-
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(this.contract.call(method, ...args))
-      .setTimeout(30)
-      .build();
-
-    const sim = await this.server.simulateTransaction(tx);
-    if (Soroban.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation failed: ${sim.error}`);
-    }
-    return sim.result ? scValToNative(sim.result.retval) : null;
-  }
-
-  /**
-   * Reads the deployed contract's `VERSION` (issue 0164 in the SDK epic).
-   *
-   * The contract's `version()` view returns a `u32` (see
-   * `contracts/keeper-registry/src/views.rs` / `constants.rs`), which
-   * `scValToNative` decodes as a JS `number` — never a string.
-   *
-   * Returns `undefined` rather than throwing when the read fails for any
-   * reason (e.g. an older deployment without a `version` function at all) —
-   * the caller decides whether that's an error; this method only reports
-   * what it found.
-   */
-  async version(): Promise<number | undefined> {
+    let simulation: rpc.Api.SimulateTransactionResponse;
     try {
-      const result = await this.read("version", []);
-      return typeof result === "number" ? result : undefined;
-    } catch {
-      return undefined;
+      simulation = await this.server.simulateTransaction(built);
+    } catch (cause) {
+      throw toKeeperError(cause, context);
     }
+    if (rpc.Api.isSimulationError(simulation)) {
+      throw toKeeperError(simulation.error, context);
+    }
+    return rpc.assembleTransaction(built, simulation).build();
+  }
+
+  /** @internal The underlying RPC server — escape hatch for {@link "./transactionBuilder.js"}'s submit path. */
+  getServer(): RpcServerLike {
+    return this.server;
   }
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * `isPermanentError` for {@link withRetry}: a decodable {@link KeeperErrorCode}
+ * is the contract's own deterministic verdict, so retrying the identical call
+ * would just pay another fee for the same rejection. Anything else (a network
+ * timeout, a dropped connection, an RPC 5xx) is presumed transient.
+ */
+function isDecodableContractError(error: unknown): boolean {
+  return decodeKeeperErrorCode(error) !== undefined;
 }

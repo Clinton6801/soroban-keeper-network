@@ -154,6 +154,7 @@ contracts/keeper-registry/src/
 ├── batch.rs       batch_register_tasks, get_tasks, get_tasks_range
 ├── admin.rs       initialize, pause, fees, transfer_admin, upgrade, sweep
 ├── views.rs       read-only getters
+├── verifier.rs    IKeeperVerifier interface, KeeperVerifierClient
 ├── invariants.rs  shared invariant assertions (tests and fuzz targets)
 └── test/          one module per area, mirroring the list above
 ```
@@ -165,11 +166,13 @@ contracts/keeper-registry/src/
 | changing a task lifecycle rule | `task.rs` + `test/<area>.rs` |
 | adding or changing an admin control | `admin.rs` + `test/admin.rs` |
 | adding a read-only view | `views.rs` + `test/…` |
-| adding an error variant | `errors.rs` — take the next free discriminant, never renumber |
+| adding an error variant | `errors.rs` — append it under your epic's `// ─── E0N — ... ───` banner (add one at the end if it doesn't exist yet, never interleave with another epic's block), at the next free discriminant, never renumber |
+| adding a type used by the contract's storage/ABI | `types.rs` — under the matching epic banner inside "Domain Types" |
 | changing a bound or magic number | `constants.rs` — it should exist in exactly one place |
-| adding an event | `events.rs`, and update the README event table |
+| adding an event | `events.rs` — under your epic's banner, same convention as `errors.rs`, and update the README event table |
 | adding a helper used by more than one entry point | `internal.rs` as `pub(crate)` |
 | adding a test fixture used by more than one test module | `test/common.rs` as `pub(crate)` |
+| changing the verifier interface or how `execute_task` calls it | `verifier.rs` + `task.rs` + `test/verifier.rs`, and `docs/VERIFIER_DESIGN.md` |
 
 Two conventions worth following, both learned the hard way:
 
@@ -180,6 +183,35 @@ Two conventions worth following, both learned the hard way:
 - **Name test helper modules after their scope** (`reentrant_token_cancel`,
   not `reentrant_token`). Two PRs that each add a generically named helper
   module will compile alone and fail once both land.
+
+---
+
+## Where Contributors Come In
+
+The MVP contract is functional and stable. The open work now focuses on three
+published epics spanning 100 issues (0051–0150):
+
+- **E03 Fuzzing & Invariant Testing** (20 issues) — property-based tests,
+  stateful model checking, and mutation testing to systematically verify the
+  money-movement invariants documented in `docs/ARCHITECTURE.md`.
+- **E04 On-chain Execution Verifier** (26 issues) — the `IKeeperVerifier`
+  interface and registry-side verification callback, allowing target protocols
+  to enforce that a keeper actually performed the promised work on-chain before
+  the registry credits the reward.
+- **E05 Batch Operations & Gas** (22 issues) — batch registration (already
+  shipped), storage layout tuning, WASM size optimization, and CPU budget work.
+
+Each epic closes with a retrospective documenting what shipped versus what was
+studied and deferred. See the **epic index** in `.github/backlog/README.md`
+for the full roadmap, including wave 3 (TypeScript SDK, Rust SDK, event
+indexer, keeper bot v2) and beyond.
+
+**Picking an issue:**
+
+1. Browse `.github/backlog/issues/` or filter by label on GitHub Issues.
+2. Look for the `good-first-issue` label if this is your first contribution.
+3. Comment on the issue to claim it before starting work.
+4. Follow the [Git Workflow](#git-workflow) and [PR Requirements](#branching--pr-rules) below.
 
 ## Git Workflow
 
@@ -361,7 +393,8 @@ cargo watch -x "test --all --features testutils"
 
 ### Test Structure
 
-- Unit tests live in `contracts/keeper-registry/src/test.rs`.
+- Unit tests live in `contracts/keeper-registry/src/test/`, split by area
+  (see the Project Structure section above).
 - Integration tests that cross contract boundaries go in `tests/`.
 - Use `Env::default()` + `env.mock_all_auths()` for simplicity in unit tests.
 - Use real auth flows when testing auth-specific paths.
@@ -378,7 +411,7 @@ not just a patched line of contract code:
 1. Minimize the crashing input (`cargo fuzz tmin <target> <path-to-crash>`)
    and commit it under `fuzz/corpus/<target>/regressions/`, so the fuzzer's
    own corpus keeps re-testing it on every future run.
-2. Add a corresponding `#[test]` in `contracts/keeper-registry/src/test.rs`
+2. Add a corresponding `#[test]` in `contracts/keeper-registry/src/test/`
    that reproduces the exact scenario **in human-readable form** — the
    actual sequence of contract calls that triggered the crash, not "replay
    these fuzzer bytes." A raw fuzzer input replay is not reviewable by a

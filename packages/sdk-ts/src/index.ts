@@ -49,57 +49,126 @@ export {
   checkContractCompatibility,
   feesAccrued,
   getFeeBps,
+  getTask,
+  isClaimable,
   isPaused,
+  keeperBalance,
   minReward,
   rewardTokenAddress,
+  taskCount,
   version,
   type CompatibilityStatus,
   type ContractCompatibility,
   type VersionOptions,
 } from "./methods/views.js";
+
+export {
+  sweepFees,
+  transferAdmin,
+  upgrade,
+  type SweepFeesParams,
+  type TransferAdminParams,
+  type UpgradeParams,
+} from "./methods/adminDualAuth.js";
+
+export {
+  keypairAuthSigner,
+  signAuthEntries,
+  type AuthEntrySigner,
+} from "./core/auth.js";
+
+export {
+  pause,
+  setFeeBps,
+  setMinReward,
+  unpause,
+  type AdminCallParams,
+  type SetFeeBpsParams,
+  type SetMinRewardParams,
+} from "./methods/admin.js";
+
+export {
   tryWithdrawRewards,
   withdrawRewards,
   type WithdrawRewardsParams,
+  type WithdrawRewardsOutcome,
 } from "./methods/withdrawRewards.js";
 export { extendDeadline, type ExtendDeadlineParams } from "./methods/extendDeadline.js";
 export {
   executeTask,
   toProofBytes,
   type ExecuteTaskParams,
+  type ExecuteTaskOutcome,
   type ProofInput,
 } from "./methods/executeTask.js";
-// Entry point for @soroban-keeper-network/sdk.
-//
-// This package began as a scaffold (backlog 0151 / epic E12) and now
-// includes the shared client plumbing, typed errors, view methods, and
-// transaction-building primitives this epic's issues need. React hooks are
-// under the separate `@soroban-keeper-network/sdk/react` entry point (see
-// `src/react/index.ts`) so non-React consumers aren't forced to install
-// React as a dependency.
+export { registerTask, type RegisterTaskParams } from "./methods/registerTask.js";
+export { increaseReward, type IncreaseRewardParams } from "./methods/increaseReward.js";
+export {
+  claimTask,
+  type ClaimTaskOutcome,
+  type ClaimTaskParams,
+} from "./methods/claimTask.js";
+export {
+  cancelTask,
+  type CancelTaskOutcome,
+  type CancelTaskParams,
+} from "./methods/cancelTask.js";
+export { expireTask, type ExpireTaskParams } from "./methods/expireTask.js";
+export {
+  stakeDeposit,
+  initiateUnbond,
+  withdrawStake,
+  slash,
+  setMinStake,
+  raiseSlashAppeal,
+  resolveSlashAppeal,
+  setDisputeWindow,
+  disputeExecution,
+  resolveExecutionDispute,
+  keeperStake,
+  pendingUnbond,
+  minStake,
+  getSlash,
+  slashHistory,
+  disputeWindow,
+  pendingReward,
+  type StakeDepositParams,
+  type InitiateUnbondParams,
+  type WithdrawStakeParams,
+  type SlashParams,
+  type SetMinStakeParams,
+  type RaiseSlashAppealParams,
+  type ResolveSlashAppealParams,
+  type SetDisputeWindowParams,
+  type DisputeExecutionParams,
+  type ResolveExecutionDisputeParams,
+} from "./methods/staking.js";
+export {
+  MAX_CALLDATA_LEN,
+  MAX_LOCK_LEDGERS,
+  MIN_LOCK_LEDGERS,
+  MIN_TTL_LEDGERS,
+} from "./constants.js";
 
 /** The SDK's own package version, kept in sync with package.json by hand until a release job automates it (see backlog 0186). */
 export const SDK_VERSION = "0.1.0";
 
-export { KeeperRegistryClient } from "./client";
-export { decodeKeeperError, KeeperContractError, KeeperErrorCode, TaskNotFoundError } from "./errors";
+export { decodeKeeperError, TaskNotFoundError } from "./errors.js";
 export {
   buildFeeBumpTransaction,
   buildTransaction,
   submitSignedTransaction,
   type ExternalSigner,
   type UnsignedTransaction,
-} from "./transactionBuilder";
-export type { KeeperRegistryClientConfig, NetworkPreset, Task } from "./types";
-export { TaskStatus, TaskType } from "./types";
-// This package is a scaffold (backlog 0151 / epic E12): build tooling,
-// TypeScript config, and a placeholder export, proving the ESM/CJS/.d.ts
-// build pipeline works end to end. The typed KeeperRegistryClient and its
-// per-entry-point methods are filled in by the rest of epic E12's issues.
-
-/** The SDK's own package version, kept in sync with package.json by hand until a release job automates it (see backlog 0186). */
-export const SDK_VERSION = "0.1.0";
-export { KeeperRegistryClient } from "./client.js";
-export type { KeeperRegistryClientOptions } from "./client.js";
+} from "./transactionBuilder.js";
+export {
+  TaskStatus,
+  TaskType,
+  type Task,
+  type PendingCredit,
+  type SlashRecord,
+  type UnbondRequest,
+} from "./types.js";
 export {
   NETWORK_PRESETS,
   NETWORK_NAMES,
@@ -109,15 +178,40 @@ export type { NetworkName, NetworkPreset } from "./network.js";
 export { withRetry } from "./retry.js";
 export type { RetryOptions } from "./retry.js";
 export {
-  KeeperErrorCode,
-  decodeKeeperError,
-  isKeeperError,
-} from "./errors.js";
-export type { DecodedKeeperError } from "./errors.js";
+  evaluateProfitability,
+  logProfitabilityDecision,
+  DEFAULT_PROFITABILITY_OPTIONS,
+  type OperationCostEstimate,
+  type ProfitabilityOptions,
+  type ProfitabilityResult,
+} from "./profitability.js";
 export {
-  SDK_VERSION,
-  COMPATIBLE_CONTRACT_VERSIONS,
-  checkContractCompatibility,
-  compatibilityWarning,
-} from "./version.js";
-export type { CompatibilityResult } from "./version.js";
+  LogEventType,
+  consoleLogger,
+  noOpLogger,
+  logError,
+  logInfo,
+  logOperationOutcome,
+  logProfitabilityEvaluation,
+  logSimulationFailed,
+  logSimulationStarted,
+  logSimulationSucceeded,
+  type ErrorLogEvent,
+  type InfoLogEvent,
+  type LogEvent,
+  type Logger,
+  type OperationOutcomeLogEvent,
+  type ProfitabilityLogEvent,
+  type SimulationLogEvent,
+} from "./logging.js";
+
+/**
+ * The treasury contract's typed client (`contracts/treasury`), namespaced
+ * rather than flattened into this module's own exports: both clients export
+ * a `keypairSigner`, an `IntegerInput`, and so on, and the two contracts'
+ * error enums are deliberately distinct types. Also available as its own
+ * subpath, `@soroban-keeper-network/sdk/treasury`, for a caller that only
+ * ever talks to the treasury and would rather not pull in the registry
+ * client's types at all.
+ */
+export * as treasury from "./treasury/index.js";

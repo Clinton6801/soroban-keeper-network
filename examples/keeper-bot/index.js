@@ -44,9 +44,14 @@
 
 require("dotenv").config();
 
+// `rpc` is the Soroban RPC namespace. It was called `SorobanRpc` until
+// @stellar/stellar-sdk v16 dropped that alias — destructuring the old name
+// yields `undefined` rather than an error, so the bot used to get all the way
+// to `new SorobanRpc.Server(...)` before failing with an unhelpful
+// "Cannot read properties of undefined". See test/rpcNamespace.test.js.
 const {
   Keypair,
-  rpc,
+  rpc: SorobanRpc,
   TransactionBuilder,
   Networks,
   BASE_FEE,
@@ -54,7 +59,21 @@ const {
   scValToNative,
   Contract,
 } = require("@stellar/stellar-sdk");
-const { Keypair, nativeToScVal, scValToNative } = require("@stellar/stellar-sdk");
+
+const {
+  DEFAULT_EXECUTOR_TIMEOUT_MS,
+  EXECUTOR_TIMEOUTS_MS,
+  getExecutorTimeout,
+  executeWithTimeout,
+} = require("./src/executors/interface.js");
+
+const {
+  OutcomeAction,
+  OutcomeStatus,
+  OutcomeStore,
+  isAmbiguousTimeoutError,
+  verifyOnChainLanding,
+} = require("./src/state/outcomes.js");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The SDK (@soroban-keeper-network/sdk) — dynamic import, not require()
@@ -80,6 +99,92 @@ async function loadSdk() {
 }
 
 let CONFIG; // Initialized in main() after validation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dry-run decision recording types and utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Structured record of a keeper decision (claim or skip).
+ * Used for deterministic logging and comparison across dry-run executions.
+ *
+ * @typedef {object} DecisionRecord
+ * @property {string} timestamp - ISO 8601 timestamp when decision was made
+ * @property {number} taskId - Task ID
+ * @property {string} decision - "claim" | "skip"
+ * @property {string} reason - Human-readable reason for the decision
+ * @property {object} [profitability] - Profitability evaluation (when applicable)
+ * @property {bigint} [profitability.reward] - Task reward in stroops
+ * @property {bigint} [profitability.estimatedFee] - Estimated total fees in stroops
+ * @property {bigint} [profitability.netProfit] - Net profit after fees in stroops
+ * @property {boolean} [profitability.profitable] - Whether the task is profitable
+ * @property {string} [profitability.profitMargin] - Configured minimum margin (string for JSON compatibility)
+ * @property {object} [taskMetadata] - Task evaluation metadata
+ * @property {string} [taskMetadata.taskType] - Task type (e.g., "TtlExtension")
+ * @property {string} [taskMetadata.verifier] - Verifier contract ID (if any)
+ * @property {number} [taskMetadata.deadline] - Task deadline in seconds
+ * @property {number} [evaluationPhase] - Which phase of evaluation led to skip
+ *   (1=deadline, 2=verifier_support, 3=proof_generation, 4=profitability)
+ */
+
+/**
+ * Creates a DecisionRecord for a skip decision.
+ *
+ * @param {number} taskId
+ * @param {string} reason
+ * @param {object} [options]
+ * @returns {DecisionRecord}
+ */
+function createSkipDecision(taskId, reason, options = {}) {
+  return {
+    timestamp: new Date().toISOString(),
+    taskId,
+    decision: "skip",
+    reason,
+    evaluationPhase: options.evaluationPhase,
+    taskMetadata: options.taskMetadata,
+    profitability: options.profitability,
+  };
+}
+
+/**
+ * Creates a DecisionRecord for a claim decision.
+ *
+ * @param {number} taskId
+ * @param {object} [options]
+ * @returns {DecisionRecord}
+ */
+function createClaimDecision(taskId, options = {}) {
+  return {
+    timestamp: new Date().toISOString(),
+    taskId,
+    decision: "claim",
+    reason: options.reason || "Task passed all profitability and eligibility checks",
+    taskMetadata: options.taskMetadata,
+    profitability: options.profitability,
+  };
+}
+
+/**
+ * Outputs a DecisionRecord as structured JSON (one per line for machine parsing).
+ * In dry-run mode, each decision is logged this way for easy comparison across runs.
+ *
+ * @param {DecisionRecord} record
+ */
+function logDecisionRecord(record) {
+  // Convert bigint fields to strings for JSON serialization
+  const serializable = {
+    ...record,
+    profitability: record.profitability ? {
+      ...record.profitability,
+      reward: String(record.profitability.reward),
+      estimatedFee: String(record.profitability.estimatedFee),
+      netProfit: String(record.profitability.netProfit),
+      profitMargin: String(record.profitability.profitMargin || "0"),
+    } : undefined,
+  };
+  console.log(JSON.stringify(serializable));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration validation
@@ -115,8 +220,7 @@ function requireEnv(name, { parse, validate, secret = false, fallback }) {
 
 async function validateAndLoadConfig() {
   const { StrKey } = require("@stellar/stellar-sdk"); // Moved inside to be used only here
-  const { NETWORK_PRESETS, NETWORK_NAMES, isNetworkName, KeeperRegistryClient } =
-    await loadSdk();
+  const { NETWORK_PRESETS, NETWORK_NAMES, isNetworkName } = await loadSdk();
 
   const network = requireEnv("NETWORK", {
     validate: {
@@ -133,25 +237,31 @@ async function validateAndLoadConfig() {
     },
   });
 
-  const secretKey = requireEnv("KEEPER_SECRET_KEY", {
-    secret: true,
-    validate: {
-      fn: StrKey.isValidEd25519SecretSeed,
-      reason: "must be a valid secret key (starts with S...)",
-    },
-  });
+  // Check if dry-run mode is enabled before requiring signing key
+  const dryRun = process.env.DRY_RUN ? process.env.DRY_RUN.toLowerCase() === "true" : false;
 
-  // After validating the required string values, we can create the client
-  // and use its underlying RPC connection to validate the contract's
-  // existence on the network.
-  const client = new KeeperRegistryClient({
-    contractId: registryContractId,
-    network: NETWORK_PRESETS[network],
-    keypair: Keypair.fromSecret(secretKey),
-  });
+  // Signing key is required for live mode only
+  let secretKey;
+  if (!dryRun) {
+    secretKey = requireEnv("KEEPER_SECRET_KEY", {
+      secret: true,
+      validate: {
+        fn: StrKey.isValidEd25519SecretSeed,
+        reason: "must be a valid secret key (starts with S...)",
+      },
+    });
+  } else {
+    // In dry-run mode, signing key is optional. Use a placeholder if provided.
+    secretKey = process.env.KEEPER_SECRET_KEY;
+  }
+
+  // After validating the required string values, we can create the server
+  // connection and use it to validate the contract's existence on the network.
+  const { rpcUrl } = NETWORK_PRESETS[network];
+  const server = createServer(rpcUrl);
 
   try {
-    await client.rpc.getContractData(registryContractId);
+    await server.getContractData(registryContractId);
   } catch (e) {
     if (e.response && e.response.status === 404) {
       fail(
@@ -168,6 +278,7 @@ async function validateAndLoadConfig() {
     network,
     registryContractId,
     secretKey,
+    dryRun,
     once: process.argv.includes("--once") || process.env.RUN_ONCE === "true",
     pollIntervalMs: requireEnv("POLL_INTERVAL_MS", {
       parse: (v) => parseInt(v, 10),
@@ -198,6 +309,14 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
+    // Minimum profit margin (in stroops) required for claiming a task.
+    // Net reward minus estimated gas fees (claim + execute + verifier) must
+    // exceed this threshold. Defaults to 0 (must be non-negative).
+    minProfitMarginStroops: requireEnv("MIN_PROFIT_MARGIN_STROOPS", {
+      parse: BigInt,
+      validate: { fn: (v) => v >= 0n, reason: "must be >= 0" },
+      fallback: 0n,
+    }),
     // Development only — see the EXECUTORS section below and .env.example
     // for the accompanying warning. Never the default: a keeper with this
     // unset and no real executor registered for a task type simply skips
@@ -205,6 +324,37 @@ async function validateAndLoadConfig() {
     simulateExecution: requireEnv("SIMULATE_EXECUTION", {
       parse: (v) => v.toLowerCase() === "true",
       fallback: false,
+    }),
+    // Dry-run mode: execute the complete evaluation pipeline without submitting
+    // transactions. All decisions (claims, skips) are logged in structured format
+    // but no state-changing calls are made. Signing key is not required.
+    dryRun: requireEnv("DRY_RUN", {
+      parse: (v) => v.toLowerCase() === "true",
+      fallback: false,
+    }),
+    // ── E06 staking (see STAKE_CHECK below and docs/STAKING_DESIGN.md) ──
+    //
+    // The deployed contract does not enforce any minimum stake to
+    // claim_task today (backlog 0292 — the issue that would decide and
+    // enforce one — is a separate, not-yet-landed follow-up). autoStake
+    // therefore has nothing to react to and STAKE_CHECK is a documented
+    // no-op: it logs the keeper's current stake each round for
+    // operational visibility, but never blocks claiming and never
+    // deposits anything on the keeper's behalf. See STAKE_CHECK's own doc
+    // comment for exactly what activates once a real minimum exists.
+    autoStakeEnabled: requireEnv("AUTO_STAKE_ENABLED", {
+      parse: (v) => v.toLowerCase() === "true",
+      fallback: false,
+    }),
+    autoStakeAmount: requireEnv("AUTO_STAKE_AMOUNT", {
+      parse: BigInt,
+      validate: { fn: (v) => v > 0n, reason: "must be > 0" },
+      fallback: 0n,
+    }),
+    autoStakeCeiling: requireEnv("AUTO_STAKE_CEILING", {
+      parse: BigInt,
+      validate: { fn: (v) => v >= 0n, reason: "must be >= 0" },
+      fallback: 0n,
     }),
   };
 }
@@ -297,6 +447,53 @@ const REGISTRY_EVENTS = {
   taskRegistered: [topicSymbol("reg"), topicSymbol("task")],
 };
 
+/**
+ * Builds the Soroban RPC client. Both call sites (startup validation and
+ * main) need identical settings, so they share one factory rather than
+ * repeating the constructor and its options.
+ *
+ * `allowHttp: false` is not configurable on purpose: every endpoint in
+ * NETWORK_CONFIG is https, and a keeper signs transactions, so quietly
+ * permitting plaintext would put a secret key's traffic on the wire.
+ *
+ * Constructing a server performs no network I/O, which is what lets the
+ * regression test in test/rpcNamespace.test.js call this offline.
+ */
+function createServer(rpcUrl) {
+  return new SorobanRpc.Server(rpcUrl, { allowHttp: false });
+}
+
+/**
+ * Evaluates a read-only contract function via simulation.
+ *
+ * No transaction is signed, submitted, or confirmed, and no sequence number
+ * is consumed — this is safe (and cheap) to call on every polling round.
+ * Use the SDK client's own typed methods (`client.claimTask`,
+ * `client.executeTask`, ...) instead for anything that mutates state, since
+ * those are the paths that actually submit.
+ *
+ * Note: simulation still builds a transaction envelope, so `server.getAccount`
+ * requires the source account to already exist (be funded) on-chain. A
+ * brand-new, unfunded keeper key will throw here.
+ */
+async function readContract(server, sourcePublicKey, networkPassphrase, contractId, method, args) {
+  const account = await server.getAccount(sourcePublicKey);
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw new Error(`Simulation failed: ${sim.error}`);
+  }
+  return sim.result ? scValToNative(sim.result.retval) : null;
+}
 // `simulateAndSend`/`invokeContract`/`readContract` used to live here as
 // hand-rolled functions. They are now `KeeperRegistryClient.invoke()` /
 // `KeeperRegistryClient.read()` in the SDK (packages/sdk-ts/src/client.ts) —
@@ -430,6 +627,175 @@ const EXECUTORS = {
   TtlExtension: ttlExtensionExecutor,
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier interface & Proof-generation strategies (0090 / 0116)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// When a task has an optional `verifier` contract attached (Phase 2), the keeper
+// must provide a proof that satisfies the verifier contract's `verify` callback.
+//
+// Keepers register verifier strategies by verifier contract address or verifier kind.
+// If a task specifies a verifier for which no strategy is registered, the keeper
+// skips the task before claiming, preventing wasted claim gas and claim locking.
+
+/**
+ * Registry of proof generation strategies for known verifiers.
+ * Key: verifier contract ID (or symbolic identifier)
+ * Value: async fn(task, ctx) => Buffer | null
+ */
+const VERIFIER_STRATEGIES = {};
+
+/**
+ * Standard baseline gas estimation constants (in stroops / min fees).
+ * 1 XLM = 10_000_000 stroops. BASE_FEE = 100 stroops.
+ *
+ * Typical transactions on Soroban consume base fee plus resource fees.
+ * Estimated conservatively if simulation cannot be executed.
+ */
+const ESTIMATED_CLAIM_FEE_STROOPS = 10_000n;
+const ESTIMATED_EXECUTE_BASE_FEE_STROOPS = 50_000n;
+
+/**
+ * Checks whether the bot has a valid proof generation mechanism for the given
+ * task and verifier.
+ *
+ * @param {object} task - Task details including taskTypeName and verifier
+ * @param {boolean} simulateExecution - Whether dev simulation fallback is active
+ * @returns {{ supported: boolean, reason?: string }}
+ */
+function checkVerifierSupport(task, simulateExecution = false) {
+  // If task has no verifier attached, standard task executor handles it.
+  if (!task.verifier) {
+    const hasExecutor = Boolean(EXECUTORS[task.taskTypeName]);
+    if (!hasExecutor && !simulateExecution) {
+      return {
+        supported: false,
+        reason: `no executor registered for task type ${task.taskTypeName}`,
+      };
+    }
+    return { supported: true };
+  }
+
+  // Task has an attached verifier contract address.
+  const strategy = VERIFIER_STRATEGIES[task.verifier];
+  if (strategy) {
+    return { supported: true };
+  }
+
+  if (simulateExecution) {
+    return { supported: true, reason: "using simulated verifier strategy" };
+  }
+
+  return {
+    supported: false,
+    reason: `unrecognized verifier contract ${task.verifier} (no proof-generation strategy registered)`,
+  };
+}
+
+/**
+ * Simulates a verifier call directly (`IKeeperVerifier::verify`) before claiming,
+ * or calculates estimated gas costs to determine if executing the task is profitable.
+ *
+ * @param {object} params
+ * @returns {Promise<{ profitable: boolean, estimatedFee: bigint, netProfit: bigint, reason?: string }>}
+ */
+async function estimateTaskProfitability({
+  server,
+  sourcePublicKey,
+  networkPassphrase,
+  task,
+  proof,
+  minProfitMargin = 0n,
+}) {
+  let estimatedVerifierFee = 0n;
+
+  if (task.verifier) {
+    if (server && sourcePublicKey) {
+      try {
+        const rawAccount = await server.getAccount(sourcePublicKey);
+        // Ensure we have an Account object that TransactionBuilder accepts
+        const account =
+          typeof rawAccount.sequenceNumber === "function"
+            ? rawAccount
+            : new (require("@stellar/stellar-sdk").Account)(
+                rawAccount.accountId || sourcePublicKey,
+                rawAccount.sequence || "1"
+              );
+
+        const verifierContract = new Contract(task.verifier);
+        const proofBytes = proof || Buffer.alloc(0);
+
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: networkPassphrase || Networks.TESTNET,
+        })
+          .addOperation(
+            verifierContract.call(
+              "verify",
+              nativeToScVal(task.taskId, { type: "u64" }),
+              nativeToScVal(sourcePublicKey, { type: "address" }),
+              nativeToScVal(proofBytes, { type: "bytes" })
+            )
+          )
+          .setTimeout(30)
+          .build();
+
+        const sim = await server.simulateTransaction(tx);
+        const isError =
+          (SorobanRpc.Api && typeof SorobanRpc.Api.isSimulationError === "function" && SorobanRpc.Api.isSimulationError(sim)) ||
+          Boolean(sim && sim.error);
+
+        if (isError) {
+          return {
+            profitable: false,
+            estimatedFee: 0n,
+            netProfit: 0n,
+            reason: `verifier simulation failed: ${sim.error || "unknown simulation error"}`,
+          };
+        }
+
+        // If minResourceFee is reported by Soroban RPC simulation, use it.
+        if (sim && sim.minResourceFee) {
+          estimatedVerifierFee = BigInt(sim.minResourceFee);
+        } else {
+          estimatedVerifierFee = 50_000n;
+        }
+      } catch (err) {
+        if (err.message && err.message.toLowerCase().includes("simulation failed")) {
+          return {
+            profitable: false,
+            estimatedFee: 0n,
+            netProfit: 0n,
+            reason: `verifier simulation failed: ${err.message}`,
+          };
+        }
+        estimatedVerifierFee = 50_000n;
+      }
+    } else {
+      // Default baseline estimate when no RPC server is provided (e.g. static evaluation)
+      estimatedVerifierFee = 50_000n;
+    }
+  }
+
+  const totalEstimatedFees =
+    ESTIMATED_CLAIM_FEE_STROOPS +
+    ESTIMATED_EXECUTE_BASE_FEE_STROOPS +
+    estimatedVerifierFee;
+
+  const reward = BigInt(task.reward);
+  const netProfit = reward - totalEstimatedFees;
+  const profitable = netProfit >= BigInt(minProfitMargin);
+
+  return {
+    profitable,
+    estimatedFee: totalEstimatedFees,
+    netProfit,
+    reason: profitable
+      ? undefined
+      : `net profit (${netProfit} stroops) below minimum margin (${minProfitMargin} stroops; estimated gas: ${totalEstimatedFees} stroops, reward: ${reward} stroops)`,
+  };
+}
+
 /**
  * Dispatches a task to its registered executor. Returns `null` (never
  * throws) when there is no executor for the task's type, when
@@ -444,6 +810,32 @@ const EXECUTORS = {
  * function directly do not run.
  */
 async function executeTaskOffChain(task, ctx, simulateExecution) {
+  const customTimeouts = (ctx && ctx.executorTimeouts) || (typeof CONFIG !== "undefined" && CONFIG && CONFIG.executorTimeouts);
+  const timeoutMs = (ctx && typeof ctx.executorTimeoutMs === "number" && ctx.executorTimeoutMs > 0)
+    ? ctx.executorTimeoutMs
+    : getExecutorTimeout(task.taskTypeName, customTimeouts);
+
+  // If task has a specific verifier strategy registered, use it.
+  if (task.verifier && VERIFIER_STRATEGIES[task.verifier]) {
+    try {
+      return await executeWithTimeout(
+        VERIFIER_STRATEGIES[task.verifier],
+        task,
+        ctx,
+        timeoutMs
+      );
+    } catch (err) {
+      if (err.code === "EXECUTOR_TIMEOUT") {
+        ctx.log(
+          `  Verifier strategy for task ${task.taskId} timed out after ${timeoutMs}ms — treating as failed attempt.`
+        );
+      } else {
+        ctx.log(`  Verifier strategy for task ${task.taskId} threw: ${err.message}`);
+      }
+      return null;
+    }
+  }
+
   const executor = EXECUTORS[task.taskTypeName];
 
   if (!executor) {
@@ -457,10 +849,105 @@ async function executeTaskOffChain(task, ctx, simulateExecution) {
   }
 
   try {
-    return await executor(task, ctx);
+    return await executeWithTimeout(executor, task, ctx, timeoutMs);
   } catch (err) {
-    ctx.log(`  Executor for task ${task.taskId} threw: ${err.message}`);
+    if (err.code === "EXECUTOR_TIMEOUT") {
+      ctx.log(
+        `  Executor for task ${task.taskId} (${task.taskTypeName}) timed out after ${timeoutMs}ms — treating as failed attempt.`
+      );
+    } else {
+      ctx.log(`  Executor for task ${task.taskId} threw: ${err.message}`);
+    }
     return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E06 — Keeper staking (see docs/STAKING_DESIGN.md)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The deployed contract has no on-chain minimum stake to claim_task — this
+// is a real decision (docs/STAKING_DESIGN.md §5: "no different treatment"
+// for a staked keeper in v1), not a gap this bot works around. `checkStake`
+// therefore cannot compare the keeper's stake against a configured floor,
+// because there is no floor to read from the contract; `keeper_stake` (0289)
+// exists as a view, but a *minimum* view/config value does not (that is
+// backlog 0292 and 0309's job, both explicitly out of this pass's scope —
+// see docs/STAKING_DESIGN.md's "Scope of this implementation").
+//
+// What this DOES do, matching the issue's "startup and periodic stake
+// checks" requirement without inventing enforcement the contract doesn't
+// have: reads and logs the keeper's current stake every round, and — only
+// if the operator has explicitly opted in via AUTO_STAKE_ENABLED — deposits
+// a fixed, operator-configured AUTO_STAKE_AMOUNT once if the keeper has
+// never staked at all (stake === 0n), capped by AUTO_STAKE_CEILING so a
+// misconfigured bot can never auto-deposit an unbounded amount. This is
+// deliberately NOT "top up to a minimum" (there is no minimum to top up
+// to) — it is "get a brand-new keeper some stake on-chain if the operator
+// wants that, once, opt-in." Once 0292/0309 land a real minimum, this
+// function is the one place that needs a second read (the minimum view)
+// and a comparison against it to become real enforcement — everything
+// else (the auto-deposit path, the ceiling, the logging) is already here.
+async function checkStake(client, keypair, stakeConfig, ctx = console) {
+  let stake;
+  try {
+    const raw = await client.read("keeper_stake", [
+      nativeToScVal(keypair.publicKey(), { type: "address" }),
+    ]);
+    stake = BigInt(raw || 0);
+  } catch (err) {
+    ctx.warn(`  Stake check failed: ${err.message}`);
+    return;
+  }
+
+  ctx.log(`  Current bonded stake: ${stake} stroops`);
+
+  if (!stakeConfig.autoStakeEnabled) {
+    return;
+  }
+  if (stake !== 0n) {
+    // Already staked something — never top up automatically beyond the
+    // keeper's own explicit stake_deposit calls, since there is no
+    // minimum this bot could be topping up TOWARD.
+    return;
+  }
+  if (stakeConfig.autoStakeAmount === 0n) {
+    ctx.warn(
+      "  AUTO_STAKE_ENABLED is true but AUTO_STAKE_AMOUNT is unset (0) — nothing to deposit."
+    );
+    return;
+  }
+  if (
+    stakeConfig.autoStakeCeiling > 0n &&
+    stakeConfig.autoStakeAmount > stakeConfig.autoStakeCeiling
+  ) {
+    ctx.warn(
+      `  AUTO_STAKE_AMOUNT (${stakeConfig.autoStakeAmount}) exceeds AUTO_STAKE_CEILING ` +
+        `(${stakeConfig.autoStakeCeiling}) — refusing to deposit rather than silently ` +
+        "depositing more than the configured ceiling allows."
+    );
+    return;
+  }
+
+  try {
+    ctx.log(
+      `  Auto-staking ${stakeConfig.autoStakeAmount} stroops (first stake for this keeper)...`
+    );
+    // Not wrapped in withRetry, matching the existing withdraw_rewards call
+    // just below this function's own call site: both are one-shot,
+    // state-mutating actions inside the periodic round, not on the
+    // task-claiming hot path retry.test.js's coverage targets.
+    await client.invoke({
+      method: "stake_deposit",
+      args: [
+        nativeToScVal(keypair.publicKey(), { type: "address" }),
+        nativeToScVal(stakeConfig.autoStakeAmount, { type: "i128" }),
+      ],
+      source: keypair.publicKey(),
+    });
+    ctx.log("  Auto-stake deposit complete.");
+  } catch (err) {
+    ctx.warn(`  Auto-stake deposit failed: ${err.message}`);
   }
 }
 
@@ -468,25 +955,151 @@ async function executeTaskOffChain(task, ctx, simulateExecution) {
 // Main keeper loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function keeperLoop(client, emptyRounds = 0) {
+/**
+ * Evaluates a batch of candidate tasks and returns only those that are:
+ * 1. Not past their deadline
+ * 2. Supported by an executor or verifier strategy
+ * 3. Can generate valid proofs
+ * 4. Are profitable after all costs
+ *
+ * This function does the heavy lifting before the main claim/execute loop,
+ * ensuring candidates are evaluated uniformly regardless of whether they
+ * arrived as a small burst or part of a large batch_register_tasks burst.
+ *
+ * @param {Array} tasks - Candidate tasks with { taskId, reward, deadline }
+ * @param {number} nowSeconds - Current Unix timestamp for deadline comparison
+ * @param {object} evaluationContext - { server, keypair, client, networkPassphrase, simulateExecution, minProfitMargin }
+ * @returns {Promise<Array>} Array of evaluated candidates sorted by netProfit (descending)
+ */
+async function evaluateCandidateBatch(tasks, nowSeconds, evaluationContext) {
+  const {
+    server,
+    keypair,
+    client,
+    networkPassphrase,
+    simulateExecution,
+    minProfitMargin,
+  } = evaluationContext;
+
+  const candidates = [];
+
+  for (const task of tasks) {
+    // Skip expired tasks immediately (no evaluation cost)
+    if (task.deadline <= nowSeconds) {
+      continue;
+    }
+
+    try {
+      // Fetch full task details (task type, verifier, calldata)
+      const fullTask = await readContract(
+        server,
+        keypair.publicKey(),
+        networkPassphrase,
+        client.contractId,
+        "get_task",
+        [nativeToScVal(task.taskId, { type: "u64" })]
+      );
+
+      const taskType = fullTask.task_type;
+      const taskTypeName = TASK_TYPE_NAMES[taskType] || `Unknown(${taskType})`;
+      const verifier = fullTask.verifier || null;
+
+      const evaluatedTask = {
+        taskId: task.taskId,
+        taskType,
+        taskTypeName,
+        calldata: fullTask.calldata,
+        reward: task.reward,
+        deadline: task.deadline,
+        verifier,
+      };
+
+      // Check if bot has a proof-generation strategy for this verifier / task type
+      const support = checkVerifierSupport(evaluatedTask, simulateExecution);
+      if (!support.supported) {
+        // Skip unsupported tasks silently during batch evaluation
+        continue;
+      }
+
+      // Generate candidate proof
+      const executorCtx = {
+        server,
+        keypair,
+        networkPassphrase,
+        log: () => {}, // Silent during batch evaluation; logging happens in main loop
+      };
+
+      const candidateProof = await executeTaskOffChain(
+        evaluatedTask,
+        executorCtx,
+        simulateExecution
+      );
+
+      if (candidateProof === null || candidateProof === undefined) {
+        // Skip tasks that cannot generate valid proofs
+        continue;
+      }
+
+      // Evaluate profitability
+      const profitCheck = await estimateTaskProfitability({
+        server,
+        sourcePublicKey: keypair.publicKey(),
+        networkPassphrase,
+        task: evaluatedTask,
+        proof: candidateProof,
+        minProfitMargin,
+      });
+
+      // Add to candidates list even if unprofitable; we'll sort and filter below
+      candidates.push({
+        ...evaluatedTask,
+        proof: candidateProof,
+        profitCheck,
+      });
+    } catch (err) {
+      // Skip tasks that fail evaluation; they will be re-evaluated in future rounds
+      console.warn(
+        `  Failed to evaluate task ${task.taskId}: ${err.message}`
+      );
+    }
+  }
+
+  // Sort by net profit descending (most profitable first)
+  candidates.sort((a, b) => {
+    const profitDiff = Number(b.profitCheck.netProfit - a.profitCheck.netProfit);
+    if (profitDiff !== 0) {
+      return profitDiff;
+    }
+    // Tie-breaker: lower task ID first (deterministic)
+    return Number(a.taskId - b.taskId);
+  });
+
+  return candidates;
+}
+
+async function keeperLoop(client, keypair, emptyRounds = 0) {
   // A round is successful if it runs to completion without any unhandled
   // exceptions. An RPC error that cannot be resolved with retries, or any
   // other unexpected error, is a failure.
   // Note: a round that finds no tasks is a success. Losing a claim race to
   // another keeper is also a success, as this is normal competitive behaviour.
-  const summary = { processed: 0, errors: [] };
+  const summary = { processed: 0, errors: [], decisions: [], skipped: 0 };
   let newEmptyRounds = emptyRounds;
-  const keypair = client.keypair;
+  const server = client.getServer();
 
   try {
     const nowSeconds = Math.floor(Date.now() / 1000);
-    console.log(`\nKeeper round at ${new Date().toISOString()}`);
+    if (CONFIG.dryRun) {
+      console.log(`\nKeeper round (DRY-RUN mode) at ${new Date().toISOString()}`);
+    } else {
+      console.log(`\nKeeper round at ${new Date().toISOString()}`);
+    }
 
-    const latestLedger = await client.rpc.getLatestLedger();
+    const latestLedger = await server.getLatestLedger();
     const startLedger = Math.max(1, latestLedger.sequence - 1000);
 
     const pendingTasks = await fetchPendingTasks(
-      client.rpc,
+      server,
       client.contractId,
       startLedger
     );
@@ -505,11 +1118,87 @@ async function keeperLoop(client, emptyRounds = 0) {
       newEmptyRounds = 0;
     }
 
-    for (const task of pendingTasks) {
-      if (summary.processed >= CONFIG.maxTasksPerRound) break;
+    // Evaluate all candidates (including batches) and sort by profitability
+    const evaluationContext = {
+      server,
+      keypair,
+      client,
+      networkPassphrase: client.networkPassphrase,
+      simulateExecution: CONFIG.simulateExecution,
+      minProfitMargin: CONFIG.minProfitMarginStroops,
+    };
 
-      if (task.deadline <= nowSeconds) {
-        if (CONFIG.expireStaleTasks) {
+    const sortedCandidates = await evaluateCandidateBatch(
+      pendingTasks,
+      nowSeconds,
+      evaluationContext
+    );
+
+    console.log(
+      `  Evaluated ${pendingTasks.length} tasks; ${sortedCandidates.length} are profitable candidates`
+    );
+
+    // Process profitable candidates in priority order until round budget exhausted
+    for (const candidate of sortedCandidates) {
+      if (summary.processed >= CONFIG.maxTasksPerRound) {
+        console.log(
+          `  Round budget exhausted (${CONFIG.maxTasksPerRound} tasks processed); ${sortedCandidates.length - summary.processed} candidates remain for future rounds`
+        );
+        break;
+      }
+
+      try {
+        console.log(
+          `  Attempting to claim task ${candidate.taskId} (reward: ${candidate.reward}, est net profit: ${candidate.profitCheck.netProfit} stroops)...`
+        );
+        if (CONFIG.dryRun) {
+          // Dry-run: record the claim decision, submit nothing.
+          const decision = createClaimDecision(candidate.taskId, {
+            reason: `Task passed all profitability and eligibility checks (est net profit: ${candidate.profitCheck.netProfit} stroops)`,
+            profitability: {
+              reward: BigInt(candidate.reward),
+              estimatedFee: candidate.profitCheck.estimatedFee,
+              netProfit: candidate.profitCheck.netProfit,
+              profitable: true,
+              profitMargin: CONFIG.minProfitMarginStroops,
+            },
+          });
+          summary.decisions.push(decision);
+          logDecisionRecord(decision);
+          console.log(`  [DRY-RUN] Task ${candidate.taskId} would be claimed`);
+          summary.processed++;
+          continue;
+        }
+        await withRetry(`claim_task ${candidate.taskId}`, () =>
+          client.claimTask({ keeper: keypair.publicKey(), taskId: candidate.taskId })
+        );
+        console.log(`  Task ${candidate.taskId} claimed!`);
+
+        await withRetry(`execute_task ${candidate.taskId}`, () =>
+          client.executeTask({
+            keeper: keypair.publicKey(),
+            taskId: candidate.taskId,
+            proof: candidate.proof,
+          })
+        );
+        console.log(
+          `  Task ${candidate.taskId} executed! Proof: ${candidate.proof.toString("hex").slice(0, 20)}...`
+        );
+        summary.processed++;
+      } catch (err) {
+        console.warn(
+          `  Failed to claim/execute task ${candidate.taskId}: ${err.message}`
+        );
+        summary.errors.push(err);
+      }
+    }
+
+    // Handle expired tasks (cannot claim, but can clean up)
+    const expiredTasks = pendingTasks.filter((t) => t.deadline <= nowSeconds);
+    if (expiredTasks.length > 0) {
+      console.log(`  ${expiredTasks.length} task(s) past deadline`);
+      for (const task of expiredTasks) {
+        if (CONFIG.expireStaleTasks && !CONFIG.dryRun) {
           try {
             await withRetry(`expire_task ${task.taskId}`, () =>
               client.invoke("expire_task", [
@@ -521,79 +1210,10 @@ async function keeperLoop(client, emptyRounds = 0) {
             );
           } catch (err) {
             console.log(
-              `  Task ${task.taskId} past deadline (skip: ${err.message})`
+              `  Task ${task.taskId} expire failed (skip: ${err.message})`
             );
           }
-        } else {
-          console.log(`  Task ${task.taskId} is past deadline, skipping`);
         }
-        continue;
-      }
-
-      try {
-        console.log(
-          `  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
-        );
-        await withRetry(`claim_task ${task.taskId}`, () =>
-          client.invoke("claim_task", [
-            nativeToScVal(keypair.publicKey(), { type: "address" }),
-            nativeToScVal(task.taskId, { type: "u64" }),
-          ])
-        );
-        console.log(`  Task ${task.taskId} claimed!`);
-
-        // Fetch full task details — the TaskRegistered event decoded in
-        // fetchPendingTasks carries only { taskId, reward, deadline }, but
-        // an executor needs task_type and calldata to know what off-chain
-        // work to perform.
-        const fullTask = await client.read("get_task", [
-          nativeToScVal(task.taskId, { type: "u64" }),
-        ]);
-        const taskType = fullTask.task_type;
-        const taskTypeName = TASK_TYPE_NAMES[taskType] || `Unknown(${taskType})`;
-
-        const executorCtx = {
-          server: client.rpc,
-          keypair,
-          networkPassphrase: client.networkPassphrase,
-          log: (msg) => console.log(msg),
-        };
-        const proof = await executeTaskOffChain(
-          {
-            taskId: task.taskId,
-            taskType,
-            taskTypeName,
-            calldata: fullTask.calldata,
-            reward: task.reward,
-            deadline: task.deadline,
-          },
-          executorCtx,
-          CONFIG.simulateExecution
-        );
-
-        if (proof === null || proof === undefined) {
-          console.log(
-            `  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
-          );
-          continue;
-        }
-
-        await withRetry(`execute_task ${task.taskId}`, () =>
-          client.invoke("execute_task", [
-            nativeToScVal(keypair.publicKey(), { type: "address" }),
-            nativeToScVal(task.taskId, { type: "u64" }),
-            nativeToScVal(proof, { type: "bytes" }),
-          ])
-        );
-        console.log(
-          `  Task ${task.taskId} executed! Proof: ${proof.toString("hex").slice(0, 20)}...`
-        );
-        summary.processed++;
-      } catch (err) {
-        console.warn(
-          `  Failed to process task ${task.taskId}: ${err.message}`
-        );
-        summary.errors.push(err);
       }
     }
   } catch (err) {
@@ -616,36 +1236,65 @@ async function keeperLoop(client, emptyRounds = 0) {
 
     if (balance >= CONFIG.withdrawThreshold) {
       console.log(`  Withdrawing ${balance} stroops...`);
-      // withdraw_rewards mutates state, so it still goes through the
-      // submitting path.
-      await client.invoke("withdraw_rewards", [
-        nativeToScVal(keypair.publicKey(), { type: "address" }),
-      ]);
-      console.log(`  Withdrawal complete!`);
+      if (CONFIG.dryRun) {
+        console.log(`  [DRY-RUN] Withdrawal would be submitted (${balance} stroops)`);
+      } else {
+        // withdraw_rewards mutates state, so it still goes through the
+        // submitting path.
+        await client.invoke("withdraw_rewards", [
+          nativeToScVal(keypair.publicKey(), { type: "address" }),
+        ]);
+        console.log(`  Withdrawal complete!`);
+      }
     }
   } catch (err) {
     console.warn(`  Balance check failed: ${err.message}`);
     summary.errors.push(err);
   }
-  return { summary, emptyRounds: newEmptyRounds };
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
+  // Periodic stake check/visibility (E06, #429) — see checkStake's own doc
+  // comment for exactly what this does and does not do today.
+  await checkStake(client, keypair, {
+    autoStakeEnabled: CONFIG.autoStakeEnabled,
+    autoStakeAmount: CONFIG.autoStakeAmount,
+    autoStakeCeiling: CONFIG.autoStakeCeiling,
+  });
+
+  return { summary, emptyRounds: newEmptyRounds };
+}// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function main() {
   await validateAndLoadConfig();
 
-  const { NETWORK_PRESETS, KeeperRegistryClient, checkContractCompatibility, compatibilityWarning } =
-    await loadSdk();
-  const { rpcUrl } = NETWORK_PRESETS[CONFIG.network];
-  const keypair = Keypair.fromSecret(CONFIG.secretKey);
-  const client = new KeeperRegistryClient({
+  const { NETWORK_PRESETS, KeeperRegistryClient, keypairSigner } = await loadSdk();
+  const { rpcUrl, networkPassphrase } = NETWORK_PRESETS[CONFIG.network];
+  
+  let keypair;
+  if (CONFIG.dryRun && !CONFIG.secretKey) {
+    // In dry-run mode without a signing key, generate a temporary keypair for address purposes
+    keypair = Keypair.random();
+    console.log(`[DRY-RUN] Using temporary keypair for read operations`);
+  } else {
+    keypair = Keypair.fromSecret(CONFIG.secretKey);
+  }
+
+  const server = createServer(rpcUrl);
+  
+  // In dry-run mode without signing key, we don't pass a signer to the client
+  // since no transactions will be submitted anyway
+  const clientOptions = {
     contractId: CONFIG.registryContractId,
-    network: CONFIG.network,
-    keypair,
-  });
+    rpcUrl,
+    networkPassphrase,
+  };
+  
+  if (!CONFIG.dryRun || CONFIG.secretKey) {
+    clientOptions.signer = keypairSigner(keypair);
+  }
+
+  const client = new KeeperRegistryClient(clientOptions);
 
   console.log("");
   console.log("Soroban Keeper Network — Keeper Bot v0.1.0          ");
@@ -654,18 +1303,27 @@ async function main() {
   console.log(`  RPC URL  : ${rpcUrl}`);
   console.log(`  Keeper   : ${keypair.publicKey()}`);
   console.log(`  Registry : ${CONFIG.registryContractId}`);
-  if (CONFIG.once) {
+  if (CONFIG.dryRun) {
+    console.log("  Mode     : DRY-RUN (decisions logged, no transactions submitted)");
+  } else if (CONFIG.once) {
     console.log("  Mode     : --once (single run)");
   } else {
     console.log(`  Poll     : every ${CONFIG.pollIntervalMs / 1000}s`);
   }
   console.log(`  Withdraw : when balance ≥ ${CONFIG.withdrawThreshold} stroops`);
+  console.log(
+    `  Staking  : ${CONFIG.autoStakeEnabled ? `auto-stake ${CONFIG.autoStakeAmount} stroops once (ceiling ${CONFIG.autoStakeCeiling || "none"})` : "visibility only (no minimum enforced on-chain — AUTO_STAKE_ENABLED=false)"}`
+  );
   console.log("");
 
   // Verify connectivity
   try {
-    const health = await client.rpc.getHealth();
-    console.log(`RPC healthy — ledger ${health.ledger}`);
+    const health = await server.getHealth();
+    // `latestLedger`, not `ledger` — the same v16 API drift as the `rpc`
+    // rename above. This one degraded quietly to "ledger undefined" instead
+    // of throwing, so the startup banner has been printing a hole where the
+    // one number that proves RPC is live should be.
+    console.log(`RPC healthy — ledger ${health.latestLedger}`);
   } catch (e) {
     console.error(`RPC unreachable at ${rpcUrl}: ${e.message}`);
     process.exit(1);
@@ -674,15 +1332,11 @@ async function main() {
   // SDK ↔ contract version compatibility check (packages/sdk-ts/VERSIONING.md).
   // Advisory only — logged, never a hard stop, since an operator running an
   // older-but-still-working combination should not be forced to upgrade to
-  // silence a warning.
-  const contractVersion = await client.version();
-  const warning = compatibilityWarning(checkContractCompatibility(contractVersion));
-  if (warning) {
-    console.warn(warning);
-  }
+  // silence a warning. `client.version()` already warns on a mismatch.
+  await client.version();
 
   if (CONFIG.once) {
-    const { summary } = await keeperLoop(client);
+    const { summary } = await keeperLoop(client, keypair);
     const ok = summary.errors.length === 0;
     console.log(ok ? "Round complete." : "Round completed with errors.");
     process.exit(ok ? 0 : 1);
@@ -713,6 +1367,7 @@ async function main() {
     try {
       const { summary, emptyRounds: newEmptyRounds } = await keeperLoop(
         client,
+        keypair,
         emptyRounds
       );
       emptyRounds = newEmptyRounds;
@@ -747,17 +1402,38 @@ function sleep(ms) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
+  createServer,
   isPermanentError,
   withRetry,
   fetchPendingTasks,
+  evaluateCandidateBatch,
   validateAndLoadConfig,
   keeperLoop,
   sleep,
   TASK_TYPE_NAMES,
   EXECUTORS,
+  VERIFIER_STRATEGIES,
+  checkVerifierSupport,
+  estimateTaskProfitability,
   executeTaskOffChain,
   ttlExtensionExecutor,
   simulatedExecutor,
+  ESTIMATED_CLAIM_FEE_STROOPS,
+  ESTIMATED_EXECUTE_BASE_FEE_STROOPS,
+  // Dry-run decision recording
+  createSkipDecision,
+  createClaimDecision,
+  logDecisionRecord,
+  checkStake,
+  DEFAULT_EXECUTOR_TIMEOUT_MS,
+  EXECUTOR_TIMEOUTS_MS,
+  getExecutorTimeout,
+  executeWithTimeout,
+  OutcomeAction,
+  OutcomeStatus,
+  OutcomeStore,
+  isAmbiguousTimeoutError,
+  verifyOnChainLanding,
 };
 
 // Only run main() when executed directly, not when imported for testing

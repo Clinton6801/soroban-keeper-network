@@ -7,10 +7,14 @@
 //! parsing path means the two cannot drift as the event set evolves.
 
 use anyhow::{Context, Result};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::ingest::{IngestOutcome, Ingestor};
-use crate::rpc::EventSource;
+use crate::progress::IngestionProgress;
+use crate::reorg::{LedgerDiscrepancyError, Observation, ReorgDetector};
+use crate::rpc::{EventSource, RawEvent};
 use crate::store::Checkpoint;
 
 /// Drives ingestion over a ledger range.
@@ -19,6 +23,8 @@ pub struct Backfiller<S: EventSource> {
     ingestor: Ingestor,
     contract_id: String,
     page_size: u32,
+    detector: ReorgDetector,
+    progress: IngestionProgress,
 }
 
 /// What a completed backfill did.
@@ -52,12 +58,50 @@ impl<S: EventSource> Backfiller<S> {
         contract_id: impl Into<String>,
         page_size: u32,
     ) -> Self {
+        let detector = ReorgDetector::new(ingestor.store().pool().clone());
         Self {
             source,
             ingestor,
             contract_id: contract_id.into(),
             page_size: page_size.max(1),
+            detector,
+            progress: IngestionProgress::new(),
         }
+    }
+
+    /// Handle to the shared ingestion-progress state (issue #359).
+    ///
+    /// The walk updates it on every cycle; the API's health check reads the
+    /// lag off it. Cloneable, so the server can hold one while the walk
+    /// keeps writing.
+    pub fn progress(&self) -> IngestionProgress {
+        self.progress.clone()
+    }
+
+    /// Fingerprint every ledger this page covers, and stop if one of them now
+    /// reads differently than it did before.
+    ///
+    /// Runs *before* the page is ingested, so a contradicted ledger's events
+    /// are never applied on top of the ones already stored for it. That is what
+    /// keeps the database from ever holding a mix of two views of one ledger:
+    /// it is not that a mix is repaired afterwards, it is that one is never
+    /// created.
+    ///
+    /// See [`crate::reorg`] for why the policy is detect-and-alert rather than
+    /// auto-reconcile.
+    async fn check_page(&self, events: &[RawEvent]) -> Result<()> {
+        let mut ledgers: Vec<u32> = events.iter().map(|event| event.ledger).collect();
+        ledgers.sort_unstable();
+        ledgers.dedup();
+
+        for ledger in ledgers {
+            if let Observation::Discrepant(discrepancy) =
+                self.detector.observe(ledger, events).await?
+            {
+                return Err(LedgerDiscrepancyError(discrepancy).into());
+            }
+        }
+        Ok(())
     }
 
     /// The ledger the next walk should start from.
@@ -86,6 +130,11 @@ impl<S: EventSource> Backfiller<S> {
             .latest_ledger()
             .await
             .context("reading the chain tip")?;
+        self.progress.observe_tip(tip);
+        // The resume point itself is progress: everything below it was fully
+        // ingested by an earlier run, and lag must reflect that immediately
+        // rather than only after this pass's first page.
+        self.progress.observe_ingested(next.saturating_sub(1));
 
         let mut report = BackfillReport {
             last_ledger: next.saturating_sub(1),
@@ -98,6 +147,8 @@ impl<S: EventSource> Backfiller<S> {
                 .get_events(&self.contract_id, next, self.page_size)
                 .await
                 .with_context(|| format!("fetching events from ledger {next}"))?;
+
+            self.check_page(&page.events).await?;
 
             let outcome = self.ingestor.ingest_batch(&page.events).await?;
             report.absorb(outcome);
@@ -117,6 +168,9 @@ impl<S: EventSource> Backfiller<S> {
                     backfill_complete: scanned_through >= tip,
                 })
                 .await?;
+            // Only after the checkpoint: "ingested" here means the same thing
+            // it means to a restart - stored and checkpointed, not in flight.
+            self.progress.observe_ingested(scanned_through);
 
             next = scanned_through.saturating_add(1);
         }
@@ -134,25 +188,73 @@ impl<S: EventSource> Backfiller<S> {
                 .await?;
         }
 
+        self.progress.observe_cycle();
         Ok(report)
     }
 
-    /// Backfill to the tip, then poll for new ledgers indefinitely.
+    /// Backfill to the tip, then poll for new ledgers until `shutdown`
+    /// resolves.
     ///
     /// The steady-state loop is the same walk with a delay between passes; it
     /// re-enters `run_to_tip`, so no second code path exists to drift.
-    pub async fn run_forever(&self, configured_start: u32, poll_interval: Duration) -> Result<()> {
+    ///
+    /// A signal is only acted on *between* passes or pages, never mid-write:
+    /// `shutdown` is raced against the in-flight pass, but when `shutdown`
+    /// wins that race the pass is not dropped -- it keeps running, bounded by
+    /// `max_drain`, so a page already fetched still gets ingested and
+    /// checkpointed rather than left half-applied. If `max_drain` elapses
+    /// first, this returns anyway rather than hanging on a stuck cycle; the
+    /// next start resumes from the last checkpoint, which is safe because
+    /// `ingest_batch` is idempotent (issue 0230).
+    pub async fn run_until_shutdown(
+        &self,
+        configured_start: u32,
+        poll_interval: Duration,
+        max_drain: Duration,
+        mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Result<()> {
         loop {
-            let report = self.run_to_tip(configured_start).await?;
-            if report.stored > 0 {
-                tracing::info!(
-                    stored = report.stored,
-                    duplicates = report.duplicates,
-                    last_ledger = report.last_ledger,
-                    "ingested events"
-                );
+            let pass = self.run_to_tip(configured_start);
+            tokio::pin!(pass);
+
+            tokio::select! {
+                biased;
+                result = &mut pass => {
+                    self.log_pass(&result?);
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown requested; draining the in-flight ingestion pass");
+                    match tokio::time::timeout(max_drain, &mut pass).await {
+                        Ok(result) => self.log_pass(&result?),
+                        Err(_) => tracing::warn!(
+                            max_drain_secs = max_drain.as_secs(),
+                            "in-flight ingestion pass did not finish within the drain window; \
+                             exiting anyway -- the next start resumes from the last checkpoint",
+                        ),
+                    }
+                    return Ok(());
+                }
             }
-            tokio::time::sleep(poll_interval).await;
+
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(poll_interval) => {}
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown requested between ingestion passes");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn log_pass(&self, report: &BackfillReport) {
+        if report.stored > 0 {
+            tracing::info!(
+                stored = report.stored,
+                duplicates = report.duplicates,
+                last_ledger = report.last_ledger,
+                "ingested events"
+            );
         }
     }
 }
@@ -395,6 +497,139 @@ mod tests {
         assert!(checkpoint.backfill_complete);
     }
 
+    /// A source that reports a ledger one way, then another way on the next
+    /// poll -- the acceptance criterion's "mock RPC source that changes its
+    /// answer between two polls", with no real reorg needed.
+    fn contradicted_history() -> Vec<RawEvent> {
+        let mut events = history();
+        // Same ledger, same transaction, different payload: the owner address
+        // the source reported for the registration has changed.
+        for event in &mut events {
+            if event.tx_hash == "tx-reg" {
+                event.values[1] = RawValue::Address("GIMPOSTER".into());
+            }
+        }
+        events
+    }
+
+    /// Rewind the checkpoint so the next walk re-reads a range it already
+    /// ingested.
+    ///
+    /// This is how a ledger actually gets read twice in production: an operator
+    /// rewinding to re-scan a range, or a crash between ingesting a page and
+    /// checkpointing it. Both re-enter the same walk, which is where the
+    /// detector sits.
+    async fn rewind_to(backfiller: &Backfiller<FixtureSource>, ledger: u32) {
+        backfiller
+            .ingestor
+            .store()
+            .save_checkpoint(Checkpoint {
+                last_ledger: ledger,
+                backfill_complete: false,
+            })
+            .await
+            .expect("rewind");
+    }
+
+    #[tokio::test]
+    async fn a_source_that_contradicts_itself_halts_ingestion() {
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+        backfiller.run_to_tip(100).await.expect("first pass");
+
+        // Re-scan the same ledgers with the source now telling a different
+        // story about the registration in ledger 101.
+        let contradicting = FixtureSource::new(contradicted_history(), 320);
+        let resumed = Backfiller::new(contradicting, backfiller.ingestor.clone(), "CCONTRACT", 100);
+        rewind_to(&resumed, 99).await;
+
+        let error = resumed
+            .run_to_tip(100)
+            .await
+            .expect_err("a contradicted ledger must stop the walk");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("reported inconsistently"), "{message}");
+        assert!(
+            message.contains("deterministic finality"),
+            "the alert must say why this is an RPC-node problem rather than a reorg: {message}"
+        );
+        assert!(
+            message.contains("no stored event was modified"),
+            "the alert must say the database was left alone: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_contradiction_leaves_the_stored_view_untouched() {
+        // The acceptance asks that the database never hold a mix of old and new
+        // data for one ledger. It never does, because the contradicted page is
+        // refused before ingestion rather than repaired afterwards.
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+        backfiller.run_to_tip(100).await.expect("first pass");
+
+        let before = backfiller
+            .ingestor
+            .store()
+            .task_history(1)
+            .await
+            .expect("before");
+        let owner_before = backfiller
+            .ingestor
+            .store()
+            .task_state(1)
+            .await
+            .expect("query")
+            .expect("task")
+            .owner;
+
+        let contradicting = FixtureSource::new(contradicted_history(), 320);
+        let resumed = Backfiller::new(contradicting, backfiller.ingestor.clone(), "CCONTRACT", 100);
+        rewind_to(&resumed, 99).await;
+        resumed.run_to_tip(100).await.expect_err("halts");
+
+        let after = resumed
+            .ingestor
+            .store()
+            .task_history(1)
+            .await
+            .expect("after");
+        let owner_after = resumed
+            .ingestor
+            .store()
+            .task_state(1)
+            .await
+            .expect("query")
+            .expect("task")
+            .owner;
+
+        assert_eq!(before.len(), after.len(), "no event was added or removed");
+        assert_eq!(
+            owner_before, owner_after,
+            "the contradicted value did not land"
+        );
+        assert_ne!(
+            owner_after, "GIMPOSTER",
+            "the second view must not have been applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewound_rescan_of_an_unchanged_source_is_not_a_discrepancy() {
+        // Re-reading a ledger is the ordinary case -- a rewind, a crash between
+        // ingest and checkpoint, an overlapping page. It must not look like a
+        // discrepancy, or the detector would fire on every normal restart.
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+        backfiller.run_to_tip(100).await.expect("first pass");
+
+        let same = FixtureSource::new(history(), 320);
+        let resumed = Backfiller::new(same, backfiller.ingestor.clone(), "CCONTRACT", 100);
+        rewind_to(&resumed, 99).await;
+
+        let report = resumed.run_to_tip(100).await.expect("replay must succeed");
+        assert_eq!(report.stored, 0, "nothing new stored");
+        assert!(report.duplicates > 0, "the range really was re-read");
+    }
+
     #[tokio::test]
     async fn steady_state_ingestion_uses_the_same_path_as_backfill() {
         let mut events = history();
@@ -429,5 +664,169 @@ mod tests {
             .expect("query")
             .expect("new task");
         assert_eq!(task.reward, I128(77));
+    }
+
+    fn immediate_shutdown() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
+
+    fn never_shutdown() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(std::future::pending())
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_any_pass_starts_stops_without_waiting_for_a_poll_interval() {
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backfiller.run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                immediate_shutdown(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "shutdown must be noticed without waiting out the (hour-long) poll interval"
+        );
+        result
+            .expect("run_until_shutdown")
+            .expect("no ingestion error");
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_pass_drains_it_before_exiting() {
+        let source = FixtureSource::new(history(), 320);
+        // The very first `get_events` call sleeps, so shutdown (already
+        // pending) is guaranteed to win the race against a pass that has
+        // only just started -- simulating a signal arriving mid-cycle.
+        source.delay_next(Duration::from_millis(30));
+        let backfiller = backfiller(source, 100).await;
+
+        backfiller
+            .run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                immediate_shutdown(),
+            )
+            .await
+            .expect("run_until_shutdown");
+
+        // The in-flight pass was drained, not truncated: its events are
+        // stored and its checkpoint saved, exactly as an uninterrupted
+        // backfill would leave them.
+        let checkpoint = backfiller
+            .ingestor
+            .store()
+            .checkpoint()
+            .await
+            .expect("checkpoint query")
+            .expect("a checkpoint was saved");
+        assert!(checkpoint.backfill_complete);
+        assert_eq!(checkpoint.last_ledger, 320);
+
+        let task = backfiller
+            .ingestor
+            .store()
+            .task_state(1)
+            .await
+            .expect("query")
+            .expect("task from the drained pass");
+        assert_eq!(task.reward, I128(1_000));
+        assert_eq!(task.status, TaskStatus::Executed);
+    }
+
+    #[tokio::test]
+    async fn a_pass_stuck_past_max_drain_still_returns() {
+        let source = FixtureSource::new(history(), 320);
+        source.delay_next(Duration::from_secs(3600));
+        let backfiller = backfiller(source, 100).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backfiller.run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_millis(20),
+                immediate_shutdown(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "max_drain must bound the wait even though the pass never finishes"
+        );
+        result
+            .expect("run_until_shutdown")
+            .expect("no ingestion error");
+    }
+
+    #[tokio::test]
+    async fn shutdown_between_passes_stops_without_waiting_for_a_poll_interval() {
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+
+        // First call: no shutdown yet, so the initial catch-up pass runs to
+        // completion and the loop reaches the inter-pass sleep, which is
+        // then immediately cut short by shutdown.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backfiller.run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                immediate_shutdown(),
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        result
+            .expect("run_until_shutdown")
+            .expect("no ingestion error");
+    }
+
+    #[tokio::test]
+    async fn a_failed_pass_propagates_the_error_instead_of_looping_forever() {
+        let source = FixtureSource::new(history(), 320);
+        source.fail_once_at(100);
+        let backfiller = backfiller(source, 100).await;
+
+        let err = backfiller
+            .run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                never_shutdown(),
+            )
+            .await
+            .expect_err("the simulated RPC failure must surface, not be swallowed");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("simulated RPC failure")),
+            "error chain should mention the simulated failure, got: {err:?}"
+        );
+    }
+    #[tokio::test]
+    async fn progress_reports_zero_lag_once_a_pass_reaches_the_tip() {
+        // Issue #359: lag is updated on every ingestion cycle. After a full
+        // pass the walk has both observed the tip and checkpointed through
+        // it, so the metric reads caught-up - and the cycle counter proves
+        // the loop actually ran rather than never starting.
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+        let progress = backfiller.progress();
+        assert_eq!(progress.snapshot().lag_ledgers(), None);
+
+        backfiller.run_to_tip(100).await.expect("backfill");
+
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.latest_known_ledger, Some(320));
+        assert_eq!(snapshot.lag_ledgers(), Some(0));
+        assert_eq!(snapshot.cycles, 1);
     }
 }

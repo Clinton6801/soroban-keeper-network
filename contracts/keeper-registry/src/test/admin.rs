@@ -1,8 +1,9 @@
 //! Admin controls: pause, fees, admin transfer, and upgrade.
 
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, IntoVal, TryIntoVal,
+    token, Address, Bytes, IntoVal, TryIntoVal, Val,
 };
 
 use super::common::*;
@@ -30,6 +31,7 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &(s.env.ledger().timestamp() + 3_600),
             &DEFAULT_TTL_LEDGERS,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -109,6 +111,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
         &(s.env.ledger().timestamp() + 100),
         &DEFAULT_TTL_LEDGERS,
         &120u32,
+        &None,
     );
 
     let claimed_keeper = Address::generate(&s.env);
@@ -133,6 +136,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
             &(s.env.ledger().timestamp() + 3_600),
             &DEFAULT_TTL_LEDGERS,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -300,6 +304,7 @@ fn test_set_min_reward_rejects_below_floor() {
             &(s.env.ledger().timestamp() + 3_600),
             &DEFAULT_TTL_LEDGERS,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -312,6 +317,7 @@ fn test_set_min_reward_rejects_below_floor() {
         &(s.env.ledger().timestamp() + 3_600),
         &DEFAULT_TTL_LEDGERS,
         &60u32,
+        &None,
     );
     assert_eq!(id, 1u64);
 }
@@ -485,4 +491,46 @@ fn test_transfer_admin_succeeds_with_both_auths_explicit() {
         "transfer must succeed when both parties explicitly authorize"
     );
     assert_eq!(s.registry.admin(), Some(new_admin));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// set_reputation_floor (claim-time enforcement is covered in test/reputation.rs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn set_reputation_floor_validates_range_and_admin() {
+    let s = setup();
+    assert_eq!(
+        s.registry.try_set_reputation_floor(&s.admin, &10_001),
+        Err(Ok(KeeperError::InvalidReputationFloor))
+    );
+    assert_eq!(s.registry.reputation_floor(), 0);
+
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.registry.try_set_reputation_floor(&stranger, &5_000),
+        Err(Ok(KeeperError::Unauthorized))
+    );
+    assert_eq!(s.registry.reputation_floor(), 0);
+
+    s.registry.set_reputation_floor(&s.admin, &10_000);
+    assert_eq!(s.registry.reputation_floor(), 10_000);
+    s.registry.set_reputation_floor(&s.admin, &0);
+    assert_eq!(s.registry.reputation_floor(), 0);
+}
+
+#[test]
+fn set_reputation_floor_emits_old_and_new_floor() {
+    let s = setup();
+    s.registry.set_reputation_floor(&s.admin, &2_500);
+    s.registry.set_reputation_floor(&s.admin, &7_000);
+
+    let events = s.env.events().all();
+    let (contract, topics, data) = events.last().unwrap();
+    assert_eq!(contract, s.registry.address);
+    let expected_topics: soroban_sdk::Vec<Val> =
+        (symbol_short!("repfloor"), symbol_short!("admin")).into_val(&s.env);
+    assert_eq!(topics, expected_topics);
+    let floors: (u32, u32) = data.try_into_val(&s.env).unwrap();
+    assert_eq!(floors, (2_500, 7_000));
 }

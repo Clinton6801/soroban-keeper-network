@@ -27,12 +27,24 @@ pub struct Config {
     pub poll_interval_secs: u64,
     /// Ledgers requested per `getEvents` page during backfill.
     pub backfill_page_size: u32,
+    /// Seconds a cached aggregate response may be served for.
+    ///
+    /// This is the staleness bound the API promises: no cached response is
+    /// ever older than this. `0` disables aggregate caching entirely, for a
+    /// deployment that needs read-your-own-writes and will pay for it.
+    pub cache_ttl_secs: u64,
     /// Requests a single client (by API key, else by IP) may make per second
     /// against the REST API or new WebSocket connections, sustained.
     pub rate_limit_per_second: u32,
     /// Extra requests a client may burst above `rate_limit_per_second`
     /// before being throttled, refilling at that same per-second rate.
     pub rate_limit_burst: u32,
+    /// Maximum seconds a SIGINT/SIGTERM shutdown waits for an in-flight
+    /// ingestion pass to finish and checkpoint before exiting anyway.
+    pub shutdown_drain_secs: u64,
+    /// Ingestion lag, in ledgers, past which /health reports unhealthy
+    /// (issue #359). Roughly 5 minutes at one ledger every ~5 seconds.
+    pub max_healthy_lag_ledgers: u32,
 }
 
 /// A configuration value that is missing or unusable.
@@ -72,6 +84,9 @@ const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8080";
 const DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 20;
 /// Default burst allowance above the sustained rate.
 const DEFAULT_RATE_LIMIT_BURST: u32 = 40;
+/// Default maximum seconds a shutdown waits for an in-flight pass to drain.
+const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+const DEFAULT_MAX_HEALTHY_LAG_LEDGERS: u32 = 60;
 
 impl Config {
     /// Read and validate configuration from the process environment.
@@ -151,6 +166,15 @@ impl Config {
             problems.push("INDEXER_BACKFILL_PAGE_SIZE must be greater than zero".to_string());
         }
 
+        // No lower bound check: zero is meaningful here (caching off), unlike
+        // the page size above where zero is simply unusable.
+        let cache_ttl_secs = optional_parsed(
+            &get,
+            "INDEXER_CACHE_TTL_SECS",
+            crate::cache::DEFAULT_TTL_SECS,
+            &mut problems,
+        );
+
         let rate_limit_per_second = optional_parsed(
             &get,
             "INDEXER_RATE_LIMIT_PER_SECOND",
@@ -169,6 +193,27 @@ impl Config {
             problems.push("INDEXER_RATE_LIMIT_PER_SECOND must be greater than zero".to_string());
         }
 
+        let shutdown_drain_secs = optional_parsed(
+            &get,
+            "INDEXER_SHUTDOWN_DRAIN_SECS",
+            DEFAULT_SHUTDOWN_DRAIN_SECS,
+            &mut problems,
+        );
+
+        let max_healthy_lag_ledgers = optional_parsed(
+            &get,
+            "INDEXER_MAX_HEALTHY_LAG_LEDGERS",
+            DEFAULT_MAX_HEALTHY_LAG_LEDGERS,
+            &mut problems,
+        );
+
+        if max_healthy_lag_ledgers == 0 {
+            // Zero would flag a fully caught-up indexer as unhealthy the
+            // moment one new ledger closes - a threshold that can never be
+            // satisfied is a misconfiguration, not strictness.
+            problems.push("INDEXER_MAX_HEALTHY_LAG_LEDGERS must be greater than zero".to_string());
+        }
+
         if problems.is_empty() {
             Ok(Self {
                 rpc_url,
@@ -178,8 +223,11 @@ impl Config {
                 bind_address,
                 poll_interval_secs,
                 backfill_page_size,
+                cache_ttl_secs,
                 rate_limit_per_second,
                 rate_limit_burst,
+                shutdown_drain_secs,
+                max_healthy_lag_ledgers,
             })
         } else {
             Err(ConfigError { problems })
@@ -241,8 +289,10 @@ mod tests {
         assert_eq!(config.bind_address, DEFAULT_BIND_ADDRESS);
         assert_eq!(config.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
         assert_eq!(config.backfill_page_size, DEFAULT_BACKFILL_PAGE_SIZE);
+        assert_eq!(config.cache_ttl_secs, crate::cache::DEFAULT_TTL_SECS);
         assert_eq!(config.rate_limit_per_second, DEFAULT_RATE_LIMIT_PER_SECOND);
         assert_eq!(config.rate_limit_burst, DEFAULT_RATE_LIMIT_BURST);
+        assert_eq!(config.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
     }
 
     #[test]

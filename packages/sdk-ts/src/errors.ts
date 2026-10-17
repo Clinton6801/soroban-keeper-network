@@ -86,6 +86,37 @@ export enum KeeperErrorCode {
    * rather than a bare number.
    */
   VerificationFailed = 24,
+  // -- E06 staking, unbonding, slashing, and the appeal window (issue #427) --
+  /** `initiate_unbond` or `slash` asked for more than the keeper's current stake. */
+  InsufficientStake = 25,
+  /** `withdraw_stake` called before the pending request's unlock ledger. */
+  UnbondNotReady = 26,
+  /** `initiate_unbond` called while a prior request has not yet been withdrawn. */
+  UnbondAlreadyPending = 27,
+  /** `withdraw_stake` called with no pending unbond request on file. */
+  NoPendingUnbond = 28,
+  /** `claim_task` rejected a keeper whose stake is below the configured `MinStake` floor. */
+  MinStakeNotMet = 29,
+  /** `raise_slash_appeal` / `resolve_slash_appeal` given a `slashId` with no matching record. */
+  SlashNotFound = 30,
+  /** `raise_slash_appeal` called after the dispute window has elapsed since the slash. */
+  AppealWindowClosed = 31,
+  /** A second `raise_slash_appeal` for a `slashId` that already has one. */
+  AppealAlreadyRaised = 32,
+  /** `raise_slash_appeal` called by an address other than the slash record's own keeper. */
+  NotSlashedKeeper = 33,
+  /** `dispute_execution` given a `taskId` with no matching pending credit for the keeper. */
+  NoPendingCredit = 34,
+  /** A second `dispute_execution` for a `taskId` whose credit is already disputed. */
+  ExecutionAlreadyDisputed = 35,
+  /** `dispute_execution` called after the credit's unlock ledger has already passed. */
+  DisputeWindowClosed = 36,
+  /** `resolve_execution_dispute` given a `taskId` with no disputed pending credit on file. */
+  NoDisputedCredit = 37,
+  /** `claim_task` rejected a keeper whose reputation is below the configured floor. */
+  ReputationBelowFloor = 38,
+  /** `set_reputation_floor` was given a floor above the maximum a keeper can ever reach. */
+  InvalidReputationFloor = 39,
 }
 
 /** Human-readable name, so an unknown future code still prints usefully. */
@@ -201,20 +232,10 @@ export function decodeKeeperErrorCode(source: unknown, depth = 0): number | unde
     for (const key of ["error", "message", "diagnosticEventsXdr", "events"]) {
       const code = decodeKeeperErrorCode(record[key], depth + 1);
       if (code !== undefined) return code;
-}
-
-/**
- * A contract call rejected with a decodable `KeeperError`, as opposed to a
- * network failure or unrelated host-level trap (see {@link decodeKeeperError}).
- */
-export class KeeperContractError extends Error {
-  readonly code: KeeperErrorCode;
-
-  constructor(code: KeeperErrorCode) {
-    super(`Keeper contract error: ${KeeperErrorCode[code] ?? code}`);
-    this.name = "KeeperContractError";
-    this.code = code;
+    }
   }
+
+  return undefined;
 }
 
 /**
@@ -226,10 +247,8 @@ export class TaskNotFoundError extends KeeperContractError {
   readonly taskId: number;
 
   constructor(taskId: number) {
-    super(KeeperErrorCode.TaskNotFound);
-    this.name = "TaskNotFoundError";
+    super(KeeperErrorCode.TaskNotFound, `Task ${taskId} not found`);
     this.taskId = taskId;
-    this.message = `Task ${taskId} not found`;
   }
 }
 
@@ -267,66 +286,6 @@ export function decodeKeeperError(message: string | undefined | null): KeeperErr
   if (!match) return undefined;
   const code = Number(match[1]);
   return code in KeeperErrorCode ? (code as KeeperErrorCode) : undefined;
-const KEEPER_ERROR_CODES = new Set<number>(
-  Object.values(KeeperErrorCode).filter(
-    (value): value is number => typeof value === "number",
-  ),
-);
-
-export function decodeKeeperError(
-  result: unknown,
-): KeeperErrorCode | undefined {
-  const code = extractKeeperErrorCode(result);
-
-  if (code === undefined) {
-    return undefined;
-  }
-
-  return KEEPER_ERROR_CODES.has(code)
-    ? (code as KeeperErrorCode)
-    : undefined;
-}
-
-function extractKeeperErrorCode(
-  result: unknown,
-): number | undefined {
-  if (!result || typeof result !== "object") {
-    return undefined;
-  }
-
-  const candidate = result as Record<string, unknown>;
-
-  const directCandidates = [
-    candidate.errorCode,
-    candidate.code,
-    candidate.contractError,
-  ];
-
-  for (const value of directCandidates) {
-    const code = toInteger(value);
-
-    if (code !== undefined) {
-      return code;
-    }
-  }
-
-  const nestedCandidates = [
-    candidate.error,
-    candidate.result,
-    candidate.simulation,
-    candidate.resultXdr,
-    candidate.errorResult,
-  ];
-
-  for (const value of nestedCandidates) {
-    const code = extractKeeperErrorCode(value);
-
-    if (code !== undefined) {
-      return code;
-    }
-  }
-
-  return undefined;
 }
 
 /** `Error(Contract, #13)` is the host's rendering of a contract `Result::Err`. */
@@ -420,70 +379,4 @@ export function toKeeperError(source: unknown, context: string): KeeperSdkError 
   return new KeeperRpcError(`${context}: ${errorText(source) ?? String(source)}`, {
     cause: source,
   });
-function toInteger(value: unknown): number | undefined {
-  if (
-    typeof value === "number" &&
-    Number.isInteger(value)
-  ) {
-    return value;
-  }
-
-  if (
-    typeof value === "string" &&
-    /^-?\d+$/.test(value)
-  ) {
-    return Number(value);
-  }
-
-  return undefined;
-/** Every code in {@link KeeperErrorCode}, for validating a decoded number is a known variant. */
-const KNOWN_CODES: ReadonlySet<number> = new Set(
-  Object.values(KeeperErrorCode).filter(
-    (v): v is number => typeof v === "number",
-  ),
-);
-
-export interface DecodedKeeperError {
-  /** The numeric discriminant exactly as it appears in the contract's error enum. */
-  code: number;
-  /** The matching {@link KeeperErrorCode} name, or `undefined` if `code` isn't a known variant (e.g. a newer contract than this SDK release understands). */
-  name: keyof typeof KeeperErrorCode | undefined;
-}
-
-/**
- * Extracts a contract error discriminant from a Soroban error message, if
- * one is present. Soroban's own simulation/transaction-failure messages
- * embed the contract's error as `Error(Contract, #<n>)` — this looks for
- * that pattern specifically, rather than guessing from an arbitrary
- * number anywhere in the string.
- */
-export function decodeKeeperError(
-  error: unknown,
-): DecodedKeeperError | undefined {
-  const message = error instanceof Error ? error.message : String(error);
-  const match = message.match(/Error\(Contract,\s*#(\d+)\)/);
-  if (!match) return undefined;
-
-  const code = Number(match[1]);
-  if (!KNOWN_CODES.has(code)) {
-    return { code, name: undefined };
-  }
-  return { code, name: KeeperErrorCode[code] as keyof typeof KeeperErrorCode };
-}
-
-/**
- * Convenience predicate: does `error` decode to this specific contract error?
- *
- * @example
- * try {
- *   await client.invoke("claim_task", [...]);
- * } catch (err) {
- *   if (isKeeperError(err, KeeperErrorCode.TaskNotFound)) {
- *     // handle the specific, expected case
- *   }
- *   throw err;
- * }
- */
-export function isKeeperError(error: unknown, code: KeeperErrorCode): boolean {
-  return decodeKeeperError(error)?.code === code;
 }
