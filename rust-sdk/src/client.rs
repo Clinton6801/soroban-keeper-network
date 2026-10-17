@@ -6,7 +6,7 @@ use crate::signing::TransactionSigner;
 pub use crate::types::{BatchTaskParams, PendingCredit, SlashRecord, Task, UnbondRequest};
 use keeper_registry::KeeperError;
 use soroban_sdk::xdr::ScVal;
-use soroban_sdk::{Address, Env, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::{Address, Bytes, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Val, Vec};
 use std::future::Future;
 use std::time::Duration;
 
@@ -686,6 +686,13 @@ impl<T: RpcTransport> KeeperRegistryClient<T> {
             .map_err(|_| RegistryClientError::Decode(format!("unexpected value {value:?}")))
     }
 
+    fn encode<V: IntoVal<Env, Val>>(&self, value: V) -> Result<ScVal, RegistryClientError> {
+        let value: Val = value.into_val(&self.env);
+        value
+            .try_into_val(&self.env)
+            .map_err(|e| RegistryClientError::Decode(format!("could not encode argument: {e:?}")))
+    }
+
     async fn simulate(
         &self,
         request: &InvocationRequest,
@@ -785,5 +792,75 @@ impl<T: RpcTransport> KeeperRegistryClient<T> {
             .map_err(|e| e.in_call(CallContext::new("set_fee_bps", crate::call_args![new_bps])))?;
         self.write("set_fee_bps", vec![admin, ScVal::U32(new_bps)])
             .await
+    }
+
+    /// Register and fund a new task for the configured signer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_task(
+        &self,
+        task_type: crate::types::TaskType,
+        calldata: Bytes,
+        reward: i128,
+        deadline: u64,
+        ttl_ledgers: u32,
+        lock_ledgers: u32,
+        verifier: Option<Address>,
+    ) -> Result<u64, RegistryClientError> {
+        let owner = self.signer_arg().map_err(|e| {
+            e.in_call(CallContext::new(
+                "register_task",
+                crate::call_args![reward, deadline, ttl_ledgers, lock_ledgers],
+            ))
+        })?;
+        self.write(
+            "register_task",
+            vec![
+                owner,
+                self.encode(task_type)?,
+                self.encode(calldata)?,
+                ScVal::I128(soroban_sdk::xdr::Int128Parts {
+                    hi: (reward >> 64) as i64,
+                    lo: reward as u64,
+                }),
+                ScVal::U64(deadline),
+                ScVal::U32(ttl_ledgers),
+                ScVal::U32(lock_ledgers),
+                self.encode(verifier)?,
+            ],
+        )
+        .await
+    }
+
+    /// Claim a pending task for the configured signer.
+    pub async fn claim_task(&self, task_id: u64) -> Result<(), RegistryClientError> {
+        let keeper = self
+            .signer_arg()
+            .map_err(|e| e.in_call(CallContext::new("claim_task", crate::call_args![task_id])))?;
+        self.write("claim_task", vec![keeper, ScVal::U64(task_id)])
+            .await
+    }
+
+    /// Execute a claimed task and submit its proof as the configured signer.
+    pub async fn execute_task(
+        &self,
+        task_id: u64,
+        proof: Bytes,
+    ) -> Result<(), RegistryClientError> {
+        let keeper = self
+            .signer_arg()
+            .map_err(|e| e.in_call(CallContext::new("execute_task", crate::call_args![task_id])))?;
+        self.write(
+            "execute_task",
+            vec![keeper, ScVal::U64(task_id), self.encode(proof)?],
+        )
+        .await
+    }
+
+    /// Withdraw the configured signer's accrued keeper rewards.
+    pub async fn withdraw_rewards(&self) -> Result<i128, RegistryClientError> {
+        let keeper = self
+            .signer_arg()
+            .map_err(|e| e.in_call(CallContext::new("withdraw_rewards", std::vec::Vec::new())))?;
+        self.write("withdraw_rewards", vec![keeper]).await
     }
 }
