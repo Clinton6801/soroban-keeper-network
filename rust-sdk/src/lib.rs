@@ -10,6 +10,7 @@ pub mod events;
 pub mod network;
 pub mod retry;
 pub mod signing;
+pub mod stream;
 pub mod treasury_client;
 pub mod types;
 
@@ -20,13 +21,17 @@ pub use client::{
 pub use cross_contract::{CrossContractInvocation, KeeperRegistryCrossContract};
 pub use error::{CallContext, Redacted};
 pub use events::{
-    EventDecodeError, FeesSweptEvent, InitializedEvent, KeeperEvent, PausedEvent,
+    decode_event, EventDecodeError, FeesSweptEvent, InitializedEvent, KeeperEvent, PausedEvent,
     RewardsWithdrawnEvent, TaskCancelledEvent, TaskClaimedEvent, TaskExecutedEvent,
     TaskExpiredEvent, TaskRegisteredEvent,
 };
 pub use network::{CustomNetworkConfig, Network, NetworkConfig, FUTURENET, MAINNET, TESTNET};
 pub use retry::{default_classify, ErrorClass, RetryPolicy, RpcCallError, TransportError};
 pub use signing::{KeypairSigner, SignerError, TransactionSigner};
+pub use stream::{
+    EventPage, EventPageRequest, EventStart, EventStreamError, EventTransport, RawContractEvent,
+    RegistryEventStream, StreamEvent,
+};
 pub use treasury_client::{Recipient, TreasuryClient};
 pub use types::{
     BatchTaskParams, PendingCredit, SlashRecord, Task, TaskStatus, TaskType, UnbondRequest,
