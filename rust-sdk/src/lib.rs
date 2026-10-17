@@ -1,7 +1,27 @@
-//! Rust client SDK for the Soroban Keeper Network contract.
+//! Rust client SDK for the Soroban Keeper Network contracts.
 //!
 //! Provides typed client wrappers, event decoders, batch operations, pluggable signing,
 //! network configurations, retry policies, and cross-contract call builders.
+//!
+//! # Feature flags
+//!
+//! This release has no optional feature flags. The default feature set is
+//! intentionally empty, so every documented API is available in all builds.
+//!
+//! # Example
+//!
+//! Network presets and retry configuration can be prepared without choosing
+//! an async runtime or RPC implementation:
+//!
+//! ```
+//! use soroban_keeper_sdk::{Network, RetryPolicy};
+//!
+//! let network = Network::Testnet;
+//! let retry = RetryPolicy::no_retry();
+//!
+//! assert!(network.rpc_url().starts_with("https://"));
+//! assert_eq!(retry.max_attempts, 1);
+//! ```
 
 pub mod client;
 pub mod cross_contract;

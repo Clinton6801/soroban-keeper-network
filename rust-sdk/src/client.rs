@@ -1,5 +1,7 @@
 //! High-level typed client for the Keeper Registry Soroban contract (Issues #333, #334, #340).
 
+#![warn(missing_docs)]
+
 use crate::error::CallContext;
 use crate::retry::{default_classify, ErrorClass, RetryPolicy, RpcCallError, TransportError};
 use crate::signing::TransactionSigner;
@@ -12,12 +14,16 @@ use std::time::Duration;
 
 /// High-level client wrapping all contract interactions for integrators and keepers.
 pub struct KeeperClient<'a, S: TransactionSigner> {
+    /// Soroban host environment used for contract invocation and decoding.
     pub env: &'a Env,
+    /// Address of the deployed keeper registry contract.
     pub contract_id: Address,
+    /// Signer whose address authorizes state-changing calls.
     pub signer: &'a S,
 }
 
 impl<'a, S: TransactionSigner> KeeperClient<'a, S> {
+    /// Create an in-process client for `contract_id` using `signer`.
     pub fn new(env: &'a Env, contract_id: Address, signer: &'a S) -> Self {
         Self {
             env,
@@ -403,15 +409,20 @@ impl<'a, S: TransactionSigner> KeeperClient<'a, S> {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors produced by the in-process [`KeeperClient`].
 pub enum ClientError {
+    /// The contract host or contract implementation rejected an invocation.
     #[error("Contract call failed: {0}")]
     ContractError(String),
+    /// The configured signer could not sign the invocation payload.
     #[error("Signer error: {0}")]
     SigningFailed(#[from] crate::signing::SignerError),
     /// Any of the above, wrapped with which call produced it (issue #345).
     #[error("{context}: {source}")]
     InCall {
+        /// Method name and redacted argument diagnostics for the failed call.
         context: CallContext,
+        /// Underlying client failure.
         #[source]
         source: Box<ClientError>,
     },
@@ -494,6 +505,7 @@ pub struct InvocationRequest {
 /// entries) that a mutating call must sign.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulationOutcome {
+    /// XDR return value produced by contract simulation.
     pub return_value: ScVal,
     /// Bytes handed to [`TransactionSigner::sign_payload`]. Building the
     /// envelope and the network-id-prefixed signature payload is the
@@ -504,8 +516,11 @@ pub struct SimulationOutcome {
 /// A simulated transaction plus the signer's signature over it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignedTransaction {
+    /// Invocation whose simulated transaction was signed.
     pub request: InvocationRequest,
+    /// Simulated transaction envelope or signature payload bytes.
     pub transaction: std::vec::Vec<u8>,
+    /// Signature bytes returned by the configured signer.
     pub signature: std::vec::Vec<u8>,
 }
 
@@ -518,11 +533,13 @@ pub struct SignedTransaction {
 /// the contract returned a `#[contracterror]` code, which the client decodes
 /// into [`KeeperError`] and never retries.
 pub trait RpcTransport {
+    /// Simulate an invocation and return its value and assembled transaction.
     fn simulate(
         &self,
         request: &InvocationRequest,
     ) -> impl Future<Output = Result<SimulationOutcome, RpcCallError<u32>>> + Send;
 
+    /// Submit a signed transaction and return its contract result value.
     fn submit(
         &self,
         signed: &SignedTransaction,
@@ -544,16 +561,22 @@ pub trait RpcTransport {
 /// policy). `Decode` means a response arrived but was not the expected shape.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryClientError {
+    /// A known keeper-registry contract error.
     #[error("contract rejected the call: {0:?}")]
     Contract(KeeperError),
+    /// A contract error code not represented by this SDK version.
     #[error("contract returned unknown error code {0}")]
     UnknownContractError(u32),
+    /// RPC transport failed before a usable result was returned.
     #[error("RPC transport failure: {0:?}")]
     Transport(TransportError),
+    /// A successful RPC response did not match the method's expected type.
     #[error("could not decode response: {0}")]
     Decode(String),
+    /// A mutating call was attempted without a configured signer.
     #[error("no signer configured; call `with_signer` before a mutating call")]
     NoSigner,
+    /// The configured signer failed to sign the simulated transaction.
     #[error("signing failed: {0}")]
     Signing(#[from] crate::signing::SignerError),
     /// Any of the above, wrapped with which call produced it (issue #345).
@@ -561,7 +584,9 @@ pub enum RegistryClientError {
     /// `read`/`write` caller - gets it for free.
     #[error("{context}: {source}")]
     InCall {
+        /// Method name and redacted argument diagnostics for the failed call.
         context: CallContext,
+        /// Underlying registry-client failure.
         #[source]
         source: Box<RegistryClientError>,
     },
@@ -658,14 +683,17 @@ impl<T: RpcTransport> KeeperRegistryClient<T> {
         self
     }
 
+    /// Deployed registry contract id used by this client.
     pub fn contract_id(&self) -> &str {
         &self.contract_id
     }
 
+    /// Soroban RPC endpoint associated with this client.
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
     }
 
+    /// Network passphrase used when assembling transaction signatures.
     pub fn network_passphrase(&self) -> &str {
         &self.network_passphrase
     }

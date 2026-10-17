@@ -11,6 +11,13 @@ readme = "README.md"
 keywords = ["stellar", "soroban", "keeper", "automation"]
 categories = ["api-bindings", "cryptography::cryptocurrencies"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+
 [dependencies]
 soroban-sdk = { workspace = true }
 thiserror = { workspace = true }
