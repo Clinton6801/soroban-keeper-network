@@ -1,6 +1,6 @@
 //! Task-condition registration and claim gating.
 
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address ,Bytes,  Env};
 
 use super::common::*;
 use crate::{KeeperError, TaskStatus, TaskType};
@@ -99,4 +99,54 @@ fn panicking_condition_is_isolated_and_fails_closed() {
         Err(Ok(KeeperError::ConditionNotMet))
     );
     assert_eq!(s.registry.get_task(&id).status, TaskStatus::Pending);
+}
+
+#[test]
+fn is_claimable_and_claim_task_share_condition_and_state_guards() {
+    // Pending + true: both paths allow the claim.
+    let s = setup();
+    let condition = s.env.register(TestCondition, ());
+    let condition_client = TestConditionClient::new(&s.env, &condition);
+    condition_client.set(&1);
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    let id = register_with_condition(&s, condition.clone());
+    assert!(s.registry.is_claimable(&id));
+    s.registry.claim_task(&first, &id);
+
+    // Claimed + active lock: task state wins regardless of condition value.
+    assert!(!s.registry.is_claimable(&id));
+    assert_eq!(
+        s.registry.try_claim_task(&second, &id),
+        Err(Ok(KeeperError::LockPeriodActive))
+    );
+    condition_client.set(&0);
+    assert!(!s.registry.is_claimable(&id));
+    assert_eq!(
+        s.registry.try_claim_task(&second, &id),
+        Err(Ok(KeeperError::LockPeriodActive))
+    );
+
+    // Claimed + expired lock + false condition: both paths reject the claim.
+    let unlock_at = s.registry.get_task(&id).claim_ledger.unwrap() + 120;
+    s.env.ledger().set_sequence_number(unlock_at);
+    assert!(!s.registry.is_claimable(&id));
+    assert_eq!(
+        s.registry.try_claim_task(&second, &id),
+        Err(Ok(KeeperError::ConditionNotMet))
+    );
+
+    // Flipping the same condition makes the same expired-lock task claimable.
+    condition_client.set(&1);
+    assert!(s.registry.is_claimable(&id));
+    s.registry.claim_task(&second, &id);
+
+    // A terminal task remains unclaimable even if its condition is true.
+    s.registry
+        .execute_task(&second, &id, &Bytes::from_slice(&s.env, b"proof"));
+    assert!(!s.registry.is_claimable(&id));
+    assert_eq!(
+        s.registry.try_claim_task(&first, &id),
+        Err(Ok(KeeperError::InvalidTaskStatus))
+    );
 }
