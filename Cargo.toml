@@ -2,7 +2,11 @@
 resolver = "2"
 members = [
     "contracts/keeper-registry",
+    "contracts/conditions/time-window",
+    "contracts/oracle-client",
     "contracts/treasury",
+    "contracts/governance-token",
+    "contracts/governance",
     "indexer",
     "rust-sdk",
 ]
